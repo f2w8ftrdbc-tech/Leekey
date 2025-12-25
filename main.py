@@ -12,7 +12,7 @@ from pathlib import Path
 st.set_page_config(page_title="私人理财中心", layout="wide")
 
 # =========================
-# 1) 本地持久化（关键：改代码/重启不丢数据）
+# 1) Local persistence (won't lose after restart)
 # =========================
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -36,7 +36,6 @@ def load_csv(path: Path, cols: list[str]) -> pd.DataFrame:
 
 
 def persist_all():
-    """把当前 session_state 写入磁盘"""
     st.session_state.records.to_csv(RECORDS_PATH, index=False, encoding="utf-8-sig")
     st.session_state.budgets.to_csv(BUDGETS_PATH, index=False, encoding="utf-8-sig")
     CONFIG_PATH.write_text(
@@ -46,7 +45,7 @@ def persist_all():
 
 
 # =========================
-# 2) Session State（启动自动从磁盘读取）
+# 2) Session state init
 # =========================
 if "records" not in st.session_state:
     st.session_state.records = load_csv(RECORDS_PATH, RECORD_COLS)
@@ -65,7 +64,6 @@ if "init_balance" not in st.session_state:
 # 3) Helpers
 # =========================
 def parse_amount(s: str) -> float:
-    """安全解析金额：支持 1,234 / $120 / -30 / 空值"""
     s = (s or "").strip()
     if s == "":
         return 0.0
@@ -96,37 +94,7 @@ def enrich_records(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def guess_type_and_amount(line: str):
-    s = (line or "").strip()
-    if not s:
-        return "", None
-
-    t = ""
-    if any(k in s for k in ["收入", "income", "到账", "工资", "入账", "+"]):
-        t = "收入"
-    if any(k in s for k in ["支出", "expense", "消费", "付款", "花了", "转出", "-"]):
-        t = "支出"
-
-    nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", s)
-    amt = None
-    if nums:
-        amt = parse_amount(nums[-1])
-        if amt and 1900 <= amt <= 2100 and len(nums) >= 2:
-            amt = parse_amount(nums[-2])
-
-    if t == "" and nums:
-        if nums[-1].startswith("-"):
-            t = "支出"
-        elif nums[-1].startswith("+"):
-            t = "收入"
-
-    return t, amt
-
-
 def parse_memo_text_to_df(text: str) -> pd.DataFrame:
-    """
-    粘贴导入文本：要求每行至少包含【YYYY-MM-DD】或【YYYY/MM/DD】+ 金额
-    """
     rows = []
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -142,18 +110,22 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
             continue
         d = d.date()
 
-        t, amt = guess_type_and_amount(line)
-        if amt is None:
+        nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", line)
+        if not nums:
             continue
+        amt = parse_amount(nums[-1])
+
+        t = normalize_type(line)
+        if t == "":
+            t = "支出" if "-" in nums[-1] else "收入"
 
         book = "生活主账"
-        cat = "其他"
-
         for b in ["生活主账", "车子专项", "学费/购汇", "理财账本"]:
             if b in line:
                 book = b
                 break
 
+        cat = "其他"
         exp_cats = ["Eat outside", "Shopping", "Bill", "Petrol", "Insurance", "Rent"]
         inc_cats = ["工资", "业余项目", "亲情赠与", "理财收益"]
         for c in exp_cats + inc_cats:
@@ -161,16 +133,10 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
                 cat = c
                 break
 
+        # note
         tmp = re.sub(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", line).strip()
         tmp = re.sub(r"[-+]?\d[\d,]*\.?\d*", "", tmp).strip()
         item = re.sub(r"\s+", " ", tmp)
-
-        if t == "" and cat in inc_cats:
-            t = "收入"
-        if t == "" and cat in exp_cats:
-            t = "支出"
-        if t == "":
-            t = "支出"
 
         rows.append({
             "日期": d,
@@ -180,16 +146,25 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
             "金额": float(abs(amt)),
             "类型": t
         })
-
     return pd.DataFrame(rows)
 
 
+def next_id() -> int:
+    df = st.session_state.records
+    if df.empty:
+        return 1
+    try:
+        return int(pd.to_numeric(df["ID"], errors="coerce").max()) + 1
+    except Exception:
+        return len(df) + 1
+
+
 # =========================
-# 4) Sidebar Input
+# 4) Sidebar input
 # =========================
 st.sidebar.header("📝 记账录入")
 
-t_type = st.sidebar.selectbox("1. 选择收支类型", ["支出", "收入"], key="type_selector")
+t_type = st.sidebar.selectbox("选择收支类型", ["支出", "收入"], key="type_selector")
 
 if t_type == "支出":
     cat_opts = ["Eat outside", "Shopping", "Bill", "Petrol", "Insurance", "Rent", "其他"]
@@ -197,12 +172,12 @@ else:
     cat_opts = ["工资", "业余项目", "亲情赠与", "理财收益", "其他"]
 
 with st.sidebar.form("record_form", clear_on_submit=True):
-    d = st.date_input("2. 日期", datetime.now())
-    b = st.selectbox("3. 归属账本", ["生活主账", "车子专项", "学费/购汇", "理财账本"])
-    c_base = st.selectbox("4. 选择分类", cat_opts)
+    d = st.date_input("日期", datetime.now())
+    b = st.selectbox("归属账本", ["生活主账", "车子专项", "学费/购汇", "理财账本"])
+    c_base = st.selectbox("选择分类", cat_opts)
     custom_c = st.text_input("如选'其他'，请手动输入名称")
-    item = st.text_input("5. 备注项目")
-    amt_input = st.text_input("6. 金额 (直接输入)", value="", placeholder="0")
+    item = st.text_input("备注项目")
+    amt_input = st.text_input("金额", value="", placeholder="0")
 
     submit = st.form_submit_button("确认存入账本")
 
@@ -210,10 +185,8 @@ with st.sidebar.form("record_form", clear_on_submit=True):
         try:
             amt = parse_amount(amt_input)
             final_cat = custom_c if (c_base == "其他" and custom_c.strip() != "") else c_base
-
-            new_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
             new_row = {
-                "ID": new_id,
+                "ID": next_id(),
                 "日期": d,
                 "账本": b,
                 "类别": final_cat,
@@ -221,9 +194,12 @@ with st.sidebar.form("record_form", clear_on_submit=True):
                 "金额": float(amt),
                 "类型": t_type
             }
-            st.session_state.records = pd.concat([st.session_state.records, pd.DataFrame([new_row])], ignore_index=True)
-            persist_all()  # ✅ 持久化
-            st.sidebar.success(f"✅ 已记录{t_type}：{final_cat} ¥{amt:,.2f}")
+            st.session_state.records = pd.concat(
+                [st.session_state.records, pd.DataFrame([new_row])],
+                ignore_index=True
+            )
+            persist_all()
+            st.sidebar.success(f"✅ 已记录 {t_type}：{final_cat} ¥{amt:,.2f}")
         except Exception:
             st.sidebar.error("金额输入有误")
 
@@ -248,24 +224,137 @@ c3.metric("累计总支出", f"¥ {exp:,.2f}", delta=f"-{exp:,.2f}")
 # =========================
 # 6) Tabs
 # =========================
-tab1, tab2 = st.tabs(["📋 历史明细与删除", "📈 理财中心（统计/导入/预算）"])
+tab1, tab2 = st.tabs(["📋 明细（行内修改/删除）", "📈 理财中心（统计/导入/预算）"])
 
-# ---- Tab1: History & Delete
+# -------------------------
+# Tab1: inline edit & delete
+# -------------------------
 with tab1:
-    if not df0.empty:
-        st.dataframe(df0.sort_values("ID", ascending=False), use_container_width=True)
-        st.divider()
+    st.subheader("📋 历史明细（直接改、直接删）")
 
-        st.write("🗑️ **删除错误记录**")
-        target_id = st.selectbox("选择要删除的记录 ID", options=df0["ID"].tolist())
-        if st.button("🔴 确认删除该记录"):
-            st.session_state.records = st.session_state.records[st.session_state.records["ID"] != target_id]
-            persist_all()  # ✅ 持久化
-            st.rerun()
+    if st.session_state.records.empty:
+        st.info("尚无记录，请在左侧录入或在「理财中心」导入。")
     else:
-        st.info("尚无记录，请在左侧录入")
+        # show latest first
+        base = st.session_state.records.copy()
+        base["日期"] = pd.to_datetime(base["日期"], errors="coerce")
+        base = base.sort_values(["日期", "ID"], ascending=[False, False]).reset_index(drop=True)
 
-# ---- Tab2: Finance Center
+        # add delete checkbox column
+        if "🗑 删除" not in base.columns:
+            base.insert(0, "🗑 删除", False)
+
+        # optional quick filters
+        f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 2.0])
+        with f1:
+            type_filter = st.multiselect("类型筛选", ["收入", "支出"], default=["收入", "支出"])
+        with f2:
+            book_filter = st.multiselect("账本筛选", sorted(base["账本"].dropna().unique().tolist()))
+        with f3:
+            cat_filter = st.multiselect("类别筛选", sorted(base["类别"].dropna().unique().tolist()))
+        with f4:
+            keyword = st.text_input("关键词（匹配项目/类别/账本）", placeholder="例如：Rent / Petrol / 工资")
+
+        view = base.copy()
+        view = view[view["类型"].isin(type_filter)]
+        if book_filter:
+            view = view[view["账本"].isin(book_filter)]
+        if cat_filter:
+            view = view[view["类别"].isin(cat_filter)]
+        if keyword.strip():
+            kw = keyword.strip()
+            mask = (
+                view["项目"].astype(str).str.contains(kw, na=False) |
+                view["类别"].astype(str).str.contains(kw, na=False) |
+                view["账本"].astype(str).str.contains(kw, na=False)
+            )
+            view = view[mask]
+
+        st.caption(f"当前显示：{len(view)} 条（勾选「🗑 删除」后点击下方按钮即可删除；修改单元格后点击保存即可落盘）")
+
+        # Editable grid
+        edited = st.data_editor(
+            view,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "🗑 删除": st.column_config.CheckboxColumn("🗑 删除", help="勾选后会被删除"),
+                "ID": st.column_config.NumberColumn("ID", disabled=True),
+                "日期": st.column_config.DateColumn("日期"),
+                "金额": st.column_config.NumberColumn("金额", format="%.2f"),
+                "类型": st.column_config.SelectboxColumn("类型", options=["收入", "支出"]),
+                "账本": st.column_config.SelectboxColumn("账本", options=["生活主账", "车子专项", "学费/购汇", "理财账本"]),
+                # 类别可以自由编辑；你也可以改成 SelectboxColumn 并提供固定选项
+                "类别": st.column_config.TextColumn("类别"),
+                "项目": st.column_config.TextColumn("项目"),
+            },
+            key="editor_records",
+        )
+
+        colA, colB, colC = st.columns([1.3, 1.3, 2.4])
+
+        with colA:
+            if st.button("💾 保存修改", type="primary"):
+                try:
+                    # apply changes back by ID
+                    edited2 = edited.copy()
+                    # remove helper derived columns if present
+                    for c in ["年份", "月份", "年月"]:
+                        if c in edited2.columns:
+                            edited2 = edited2.drop(columns=[c])
+
+                    # rebuild full table: take original, update rows that appear in edited view
+                    full = st.session_state.records.copy()
+                    full["ID"] = pd.to_numeric(full["ID"], errors="coerce").astype(int)
+                    edited2["ID"] = pd.to_numeric(edited2["ID"], errors="coerce").astype(int)
+
+                    # update non-deleted rows
+                    # (we do NOT delete here; deletion is separate button)
+                    upd_cols = ["日期", "账本", "类别", "项目", "金额", "类型"]
+                    for _, row in edited2.iterrows():
+                        rid = int(row["ID"])
+                        for col in upd_cols:
+                            full.loc[full["ID"] == rid, col] = row[col]
+
+                    st.session_state.records = full[RECORD_COLS]
+                    persist_all()
+                    st.success("✅ 已保存修改（并写入 data/records.csv）")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存失败：{e}")
+
+        with colB:
+            if st.button("🗑 执行删除（删勾选行）"):
+                try:
+                    del_ids = edited.loc[edited["🗑 删除"] == True, "ID"].tolist()
+                    del_ids = [int(x) for x in del_ids]
+                    if not del_ids:
+                        st.info("你还没有勾选任何要删除的记录。")
+                    else:
+                        full = st.session_state.records.copy()
+                        full["ID"] = pd.to_numeric(full["ID"], errors="coerce").astype(int)
+                        full = full[~full["ID"].isin(del_ids)].copy()
+                        st.session_state.records = full[RECORD_COLS]
+                        persist_all()
+                        st.success(f"✅ 已删除 {len(del_ids)} 条记录")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"删除失败：{e}")
+
+        with colC:
+            st.download_button(
+                "⬇️ 下载当前备份（records_backup.csv）",
+                data=st.session_state.records.to_csv(index=False).encode("utf-8-sig"),
+                file_name="records_backup.csv",
+                mime="text/csv"
+            )
+            st.caption("自动保存位置：data/records.csv（你改代码/重启后会自动加载）")
+
+
+# -------------------------
+# Tab2: finance center (import + stats + budget)
+# -------------------------
 with tab2:
     st.subheader("📥 数据导入（CSV/Excel/备忘录文本）")
 
@@ -282,8 +371,6 @@ with tab2:
 
                 st.write("预览：")
                 st.dataframe(df_in.head(30), use_container_width=True)
-
-                st.info("映射列名到系统字段（列名不一致也没关系）。")
 
                 cols = df_in.columns.tolist()
                 m1, m2, m3 = st.columns(3)
@@ -308,6 +395,7 @@ with tab2:
                     if col_type != "<无>":
                         tmp["类型"] = df_in.loc[tmp.index, col_type].astype(str).apply(normalize_type)
                         tmp = tmp[tmp["类型"].isin(["收入", "支出"])]
+                        tmp["金额"] = tmp["金额"].abs()
                     else:
                         tmp["类型"] = tmp["金额"].apply(lambda x: "支出" if x < 0 else "收入")
                         tmp["金额"] = tmp["金额"].abs()
@@ -327,15 +415,13 @@ with tab2:
                     else:
                         tmp["项目"] = ""
 
-                    tmp["金额"] = tmp["金额"].abs()
-
-                    start_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
-                    tmp.insert(0, "ID", range(start_id, start_id + len(tmp)))
+                    start = next_id()
+                    tmp.insert(0, "ID", range(start, start + len(tmp)))
                     tmp = tmp[RECORD_COLS]
 
                     st.session_state.records = pd.concat([st.session_state.records, tmp], ignore_index=True)
-                    persist_all()  # ✅ 持久化
-                    st.success(f"✅ 已导入 {len(tmp)} 条记录（已自动保存到 data/records.csv）")
+                    persist_all()
+                    st.success(f"✅ 已导入 {len(tmp)} 条（已自动保存到 data/records.csv）")
                     st.rerun()
 
             except Exception as e:
@@ -354,16 +440,13 @@ with tab2:
             if df_m.empty:
                 st.warning("没有解析出有效记录：请确保每行至少包含【YYYY-MM-DD】或【YYYY/MM/DD】日期 + 金额。")
             else:
-                st.write("解析预览：")
-                st.dataframe(df_m.head(100), use_container_width=True)
-
-                start_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
-                df_m.insert(0, "ID", range(start_id, start_id + len(df_m)))
+                start = next_id()
+                df_m.insert(0, "ID", range(start, start + len(df_m)))
                 df_m = df_m[RECORD_COLS]
 
                 st.session_state.records = pd.concat([st.session_state.records, df_m], ignore_index=True)
-                persist_all()  # ✅ 持久化
-                st.success(f"✅ 已导入 {len(df_m)} 条记录（已自动保存到 data/records.csv）")
+                persist_all()
+                st.success(f"✅ 已导入 {len(df_m)} 条（已自动保存到 data/records.csv）")
                 st.rerun()
 
     with imp_tab3:
@@ -377,20 +460,16 @@ with tab2:
 
     st.divider()
 
-    # =========================
-    # 统计中心
-    # =========================
     st.subheader("📊 统计中心（按年/月/日期区间）")
-
     df = enrich_records(st.session_state.records)
     if df.empty:
-        st.info("暂无数据可统计，请先录入或导入。")
+        st.info("暂无数据可统计。")
     else:
         colA, colB, colC = st.columns([1.2, 1.2, 2.0])
         with colA:
             mode = st.radio("统计口径", ["年份", "月份", "自定义区间"], horizontal=True)
         with colB:
-            type_filter = st.multiselect("收支类型筛选", ["收入", "支出"], default=["收入", "支出"])
+            type_filter = st.multiselect("收支类型筛选", ["收入", "支出"], default=["收入", "支出"], key="stat_type_filter")
 
         if mode == "年份":
             with colC:
@@ -407,70 +486,35 @@ with tab2:
                 min_d = df["日期"].min().date()
                 max_d = df["日期"].max().date()
                 dr = st.date_input("选择日期区间", value=(min_d, max_d))
-            if isinstance(dr, tuple) and len(dr) == 2:
-                start_d, end_d = dr
-            else:
-                start_d = end_d = dr
+            start_d, end_d = dr if isinstance(dr, tuple) else (dr, dr)
             fdf = df[(df["日期"].dt.date >= start_d) & (df["日期"].dt.date <= end_d)]
 
         fdf = fdf[fdf["类型"].isin(type_filter)]
-        st.caption(f"当前筛选后记录数：{len(fdf)}")
-
         if fdf.empty:
-            st.warning("筛选后没有记录，请调整条件。")
+            st.warning("筛选后没有记录。")
         else:
             income_sum = fdf[fdf["类型"] == "收入"]["金额"].sum()
             expense_sum = fdf[fdf["类型"] == "支出"]["金额"].sum()
             net_sum = income_sum - expense_sum
 
             s1, s2, s3 = st.columns(3)
-            s1.metric("筛选区间收入合计", f"¥ {income_sum:,.2f}")
-            s2.metric("筛选区间支出合计", f"¥ {expense_sum:,.2f}")
-            s3.metric("筛选区间净额(收入-支出)", f"¥ {net_sum:,.2f}")
-
-            dim_col1, dim_col2 = st.columns([1.5, 2.5])
-            with dim_col1:
-                group_dim = st.selectbox("选择统计维度", ["类别", "账本", "类型", "项目", "年月", "年份", "月份"], index=0)
-            with dim_col2:
-                sort_desc = st.checkbox("按金额从高到低排序", value=True)
-
-            summary = (
-                fdf.groupby(group_dim, as_index=False)["金额"]
-                .sum()
-                .rename(columns={"金额": "总额"})
-            )
-            summary = summary.sort_values("总额", ascending=not sort_desc)
-            st.write("### ✅ 分支汇总")
-            st.dataframe(summary.round(2), use_container_width=True)
+            s1.metric("收入合计", f"¥ {income_sum:,.2f}")
+            s2.metric("支出合计", f"¥ {expense_sum:,.2f}")
+            s3.metric("净额(收入-支出)", f"¥ {net_sum:,.2f}")
 
             st.write("### 📈 趋势（按月汇总）")
             mdf = fdf.groupby(["年月", "类型"], as_index=False)["金额"].sum().sort_values("年月")
             mwide = mdf.pivot_table(index="年月", columns="类型", values="金额", aggfunc="sum", fill_value=0)
             st.line_chart(mwide)
 
-            st.write("### 🧁 类别占比（条形图）")
-            chart_type = st.radio("选择占比类型", ["支出占比", "收入占比"], horizontal=True)
-            target_type = "支出" if chart_type == "支出占比" else "收入"
-            cdf = fdf[fdf["类型"] == target_type]
-            if cdf.empty:
-                st.info(f"当前筛选条件下没有{target_type}记录。")
-            else:
-                cat_sum = cdf.groupby("类别")["金额"].sum().sort_values(ascending=False)
-                st.bar_chart(cat_sum)
-
     st.divider()
 
-    # =========================
-    # 预算（可选）
-    # =========================
     st.subheader("🎯 预算（可选）")
-
     left, right = st.columns([1.2, 2.8])
     with left:
-        st.markdown("**录入/更新预算**")
         df_now = enrich_records(st.session_state.records)
         all_ym = sorted(df_now["年月"].unique().tolist()) if not df_now.empty else ["2025-12"]
-        all_cats = sorted(df_now["类别"].unique().tolist()) if not df_now.empty else ["其他"]
+        all_cats = sorted(df_now["类别"].dropna().unique().tolist()) if not df_now.empty else ["其他"]
 
         bud_ym = st.selectbox("预算年月", all_ym)
         bud_cat = st.selectbox("预算类别", all_cats)
@@ -483,17 +527,13 @@ with tab2:
             mask = (bud_df["年月"] == bud_ym) & (bud_df["类别"] == bud_cat) & (bud_df["类型"] == bud_type)
             bud_df = bud_df[~mask]
             bud_df = pd.concat([bud_df, pd.DataFrame([{
-                "年月": bud_ym,
-                "类别": bud_cat,
-                "类型": bud_type,
-                "预算金额": float(bud_amt)
+                "年月": bud_ym, "类别": bud_cat, "类型": bud_type, "预算金额": float(bud_amt)
             }])], ignore_index=True)
             st.session_state.budgets = bud_df
-            persist_all()  # ✅ 持久化
-            st.success(f"已保存预算：{bud_ym}/{bud_cat}/{bud_type}=¥{bud_amt:,.2f}")
+            persist_all()
+            st.success("已保存预算。")
 
     with right:
-        st.markdown("**预算对比视图**")
         df_now = enrich_records(st.session_state.records)
         if df_now.empty:
             st.info("暂无记录。")
@@ -518,35 +558,25 @@ with tab2:
             else:
                 st.info("请选择至少一个年月查看预算对比。")
 
-    st.divider()
-
-    # ✅ 紧急备份按钮（任何时候都能导出）
-    st.subheader("🛟 紧急备份（建议你现在点一次）")
-    st.download_button(
-        "⬇️ 下载当前 records 备份（records_backup.csv）",
-        data=st.session_state.records.to_csv(index=False).encode("utf-8-sig"),
-        file_name="records_backup.csv",
-        mime="text/csv"
-    )
-    st.caption("本地也已自动保存到 data/records.csv；这个按钮是额外保险。")
-
 
 # =========================
 # 7) Settings
 # =========================
 with st.expander("⚙️ 账户配置"):
-    new_init = st.number_input("1. 设置起始资金", value=float(st.session_state.init_balance))
+    new_init = st.number_input("设置起始资金", value=float(st.session_state.init_balance))
     if new_init != st.session_state.init_balance:
         st.session_state.init_balance = float(new_init)
-        persist_all()  # ✅ 持久化
+        persist_all()
+        st.success("起始资金已保存。")
 
-    colx, coly = st.columns(2)
-    with colx:
-        if st.button("💾 手动保存到本地（写入 data/records.csv）"):
-            persist_all()
-            st.success("已保存。")
-    with coly:
-        if st.button("🚨 清空所有记录（不可逆）"):
-            st.session_state.records = pd.DataFrame(columns=RECORD_COLS)
-            persist_all()  # ✅ 持久化
-            st.rerun()
+    st.download_button(
+        "⬇️ 下载 records 备份（records_backup.csv）",
+        data=st.session_state.records.to_csv(index=False).encode("utf-8-sig"),
+        file_name="records_backup.csv",
+        mime="text/csv"
+    )
+
+    if st.button("🚨 清空所有记录（不可逆）"):
+        st.session_state.records = pd.DataFrame(columns=RECORD_COLS)
+        persist_all()
+        st.rerun()
