@@ -4,10 +4,11 @@ from datetime import datetime
 import re
 import json
 from pathlib import Path
-import os
 import hashlib
 import hmac
 import secrets
+import time
+import streamlit.components.v1 as components
 
 # =================================
 # 0) Page
@@ -23,18 +24,61 @@ DATA_DIR.mkdir(exist_ok=True)
 USERS_DIR = DATA_DIR / "users"
 USERS_DIR.mkdir(exist_ok=True)
 
-AUTH_PATH = DATA_DIR / "auth_users.json"   # store user credentials (hashed)
-APP_CONFIG_PATH = DATA_DIR / "app_config.json"  # store app secret etc.
+AUTH_PATH = DATA_DIR / "auth_users.json"      # store user credentials & session tokens (hashed)
+APP_CONFIG_PATH = DATA_DIR / "app_config.json"  # app secret
 
 RECORD_COLS = ["ID", "日期", "账本", "类别", "项目", "金额", "类型"]
 BUDGET_COLS = ["年月", "类别", "类型", "预算金额"]
 
+COOKIE_NAME = "pf_auth"   # persistent login cookie name
+
 
 # =================================
-# 2) Security: password hashing
+# 2) Cookie helpers via components
+# =================================
+def cookie_get(name: str) -> str:
+    # Returns cookie value string or "".
+    html = f"""
+    <script>
+    function getCookie(name) {{
+      const value = `; ${{document.cookie}}`;
+      const parts = value.split(`; ${{name}}=`);
+      if (parts.length === 2) return parts.pop().split(';').shift();
+      return "";
+    }}
+    const v = getCookie("{name}");
+    Streamlit.setComponentValue(v || "");
+    </script>
+    """
+    return components.html(html, height=0, width=0)
+
+
+def cookie_set(name: str, value: str, days: int = 30):
+    # Set cookie for `days` days.
+    html = f"""
+    <script>
+    const d = new Date();
+    d.setTime(d.getTime() + ({days}*24*60*60*1000));
+    const expires = "expires="+ d.toUTCString();
+    document.cookie = "{name}={value};" + expires + ";path=/;SameSite=Lax";
+    </script>
+    """
+    components.html(html, height=0, width=0)
+
+
+def cookie_delete(name: str):
+    html = f"""
+    <script>
+    document.cookie = "{name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+    </script>
+    """
+    components.html(html, height=0, width=0)
+
+
+# =================================
+# 3) Security: password hashing + token signing
 # =================================
 def load_app_secret() -> str:
-    """Get or create a persistent app secret used for hashing."""
     if APP_CONFIG_PATH.exists():
         cfg = json.loads(APP_CONFIG_PATH.read_text(encoding="utf-8"))
         if cfg.get("app_secret"):
@@ -48,12 +92,10 @@ APP_SECRET = load_app_secret()
 
 
 def pbkdf2_hash_password(password: str, salt_hex: str | None = None) -> dict:
-    """Return dict with salt and hash using PBKDF2-HMAC-SHA256."""
     if salt_hex is None:
         salt = secrets.token_bytes(16)
     else:
         salt = bytes.fromhex(salt_hex)
-    # combine user password with app secret so even if auth_users.json leaked, cracking harder
     pwd = (password + APP_SECRET).encode("utf-8")
     dk = hashlib.pbkdf2_hmac("sha256", pwd, salt, 200_000)
     return {"salt": salt.hex(), "hash": dk.hex()}
@@ -78,14 +120,40 @@ def save_auth_db(db: dict):
 
 
 def normalize_username(u: str) -> str:
-    """Allow letters/digits/_ only to avoid path traversal."""
     u = (u or "").strip()
     u = re.sub(r"[^A-Za-z0-9_]", "", u)
     return u.lower()
 
 
+def sign_token(raw_token: str) -> str:
+    # HMAC signature so cookie can't be forged easily
+    sig = hmac.new(APP_SECRET.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256).hexdigest()
+    return sig
+
+
+def make_session_cookie_value(username: str, raw_token: str) -> str:
+    # store username|token|sig
+    sig = sign_token(f"{username}|{raw_token}")
+    return f"{username}|{raw_token}|{sig}"
+
+
+def parse_session_cookie_value(v: str):
+    # returns (username, raw_token) if valid format else (None, None)
+    try:
+        parts = (v or "").split("|")
+        if len(parts) != 3:
+            return None, None
+        username, raw_token, sig = parts
+        expected = sign_token(f"{username}|{raw_token}")
+        if not hmac.compare_digest(expected, sig):
+            return None, None
+        return username, raw_token
+    except Exception:
+        return None, None
+
+
 # =================================
-# 3) User-scoped persistence
+# 4) User-scoped persistence + profile
 # =================================
 def user_dir(username: str) -> Path:
     d = USERS_DIR / username
@@ -115,15 +183,18 @@ def load_csv(path: Path, cols: list[str]) -> pd.DataFrame:
 def prepare_for_editor(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=RECORD_COLS)
+
     x = df.copy()
     for c in RECORD_COLS:
         if c not in x.columns:
             x[c] = "" if c not in ["ID", "金额"] else 0
 
     x["ID"] = pd.to_numeric(x["ID"], errors="coerce").fillna(0).astype(int)
+
     d = pd.to_datetime(x["日期"], errors="coerce")
     x = x[~d.isna()].copy()
     x["日期"] = pd.to_datetime(x["日期"], errors="coerce").dt.date
+
     x["金额"] = pd.to_numeric(x["金额"], errors="coerce").fillna(0.0).astype(float)
 
     for c in ["账本", "类别", "项目", "类型"]:
@@ -145,24 +216,48 @@ def enrich_records(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def load_user_config(username: str) -> dict:
+    p = paths_for_user(username)["config"]
+    if p.exists():
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    else:
+        cfg = {}
+
+    # defaults
+    cfg.setdefault("init_balance", 0.0)
+    cfg.setdefault("nickname", username)
+    cfg.setdefault("avatar", "🙂")  # emoji
+    return cfg
+
+
+def save_user_config(username: str, cfg: dict):
+    p = paths_for_user(username)["config"]
+    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def persist_user_state(username: str):
     p = paths_for_user(username)
     st.session_state.records.to_csv(p["records"], index=False, encoding="utf-8-sig")
     st.session_state.budgets.to_csv(p["budgets"], index=False, encoding="utf-8-sig")
-    p["config"].write_text(
-        json.dumps({"init_balance": st.session_state.init_balance}, ensure_ascii=False),
-        encoding="utf-8"
-    )
+
+    cfg = load_user_config(username)
+    cfg["init_balance"] = float(st.session_state.init_balance)
+    # nickname/avatar stored in cfg (maybe updated elsewhere)
+    save_user_config(username, cfg)
 
 
 def load_user_state(username: str):
     p = paths_for_user(username)
     st.session_state.records = prepare_for_editor(load_csv(p["records"], RECORD_COLS))
     st.session_state.budgets = load_csv(p["budgets"], BUDGET_COLS)
-    if p["config"].exists():
-        st.session_state.init_balance = json.loads(p["config"].read_text(encoding="utf-8")).get("init_balance", 0.0)
-    else:
-        st.session_state.init_balance = 0.0
+
+    cfg = load_user_config(username)
+    st.session_state.init_balance = float(cfg.get("init_balance", 0.0))
+    st.session_state.nickname = cfg.get("nickname", username)
+    st.session_state.avatar = cfg.get("avatar", "🙂")
 
 
 def next_id() -> int:
@@ -192,98 +287,207 @@ def normalize_type(t: str) -> str:
 
 
 # =================================
-# 4) Auth UI (register/login/logout)
+# 5) Auth: register/login/logout + persistence
 # =================================
-def auth_panel():
-    st.sidebar.header("🔐 登录 / 注册")
+def create_or_rotate_session_token(db: dict, username: str) -> str:
+    raw = secrets.token_urlsafe(24)
+    # store hashed token (not plaintext)
+    token_hash = hashlib.sha256((raw + APP_SECRET).encode("utf-8")).hexdigest()
+    db[username]["session_token_hash"] = token_hash
+    db[username]["session_token_issued_at"] = datetime.now().isoformat()
+    save_auth_db(db)
+    return raw
 
-    if "authed_user" not in st.session_state:
-        st.session_state.authed_user = None
+
+def verify_session_token(db: dict, username: str, raw_token: str) -> bool:
+    if username not in db:
+        return False
+    rec = db[username]
+    stored = rec.get("session_token_hash", "")
+    if not stored:
+        return False
+    token_hash = hashlib.sha256((raw_token + APP_SECRET).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(stored, token_hash)
+
+
+def login(username: str):
+    st.session_state.authed_user = username
+    load_user_state(username)
+
+
+def logout():
+    # clear server-side authed state
+    st.session_state.authed_user = None
+    for k in ["records", "budgets", "init_balance", "nickname", "avatar"]:
+        st.session_state.pop(k, None)
+    # clear cookie
+    cookie_delete(COOKIE_NAME)
+    st.session_state.show_login = False
+    st.rerun()
+
+
+def ensure_user_storage(username: str):
+    ud = user_dir(username)
+    (ud / "records.csv").touch(exist_ok=True)
+    (ud / "budgets.csv").touch(exist_ok=True)
+    cfgp = ud / "config.json"
+    if not cfgp.exists():
+        cfgp.write_text(json.dumps({"init_balance": 0.0, "nickname": username, "avatar": "🙂"}, ensure_ascii=False), encoding="utf-8")
+
+
+def try_cookie_auto_login():
+    # only try once per session
+    if st.session_state.get("_cookie_checked"):
+        return
+    st.session_state["_cookie_checked"] = True
+
+    if st.session_state.get("authed_user"):
+        return
+
+    v = cookie_get(COOKIE_NAME)
+    if not v:
+        return
+
+    username, raw_token = parse_session_cookie_value(v)
+    if not username or not raw_token:
+        return
+
+    db = load_auth_db()
+    username = normalize_username(username)
+    if not username or username not in db:
+        return
+
+    if verify_session_token(db, username, raw_token):
+        ensure_user_storage(username)
+        login(username)
+        # 不强制 rerun，让页面自然继续渲染即可
+    else:
+        # invalid cookie -> clear
+        cookie_delete(COOKIE_NAME)
+
+
+def top_login_bar():
+    # right top bar (visual)
+    col_left, col_right = st.columns([5, 1])
+
+    with col_left:
+        st.markdown("## 💰 私人理财中心")
+
+    with col_right:
+        if st.session_state.get("authed_user"):
+            avatar = st.session_state.get("avatar", "🙂")
+            nickname = st.session_state.get("nickname", st.session_state.authed_user)
+            st.markdown(
+                f"""
+                <div style="text-align:right; font-size:14px; line-height:1.2;">
+                  <div>{avatar} <b>{nickname}</b></div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            if st.button("退出", key="logout_top"):
+                logout()
+        else:
+            if st.button("登录 / 注册", key="login_top"):
+                st.session_state.show_login = True
+
+
+def login_panel():
+    if st.session_state.get("authed_user"):
+        return
+
+    if not st.session_state.get("show_login"):
+        return
 
     db = load_auth_db()
 
-    if st.session_state.authed_user:
-        st.sidebar.success(f"已登录：{st.session_state.authed_user}")
-        if st.sidebar.button("退出登录"):
-            st.session_state.authed_user = None
-            # 清理用户数据（防止串号）
-            for k in ["records", "budgets", "init_balance"]:
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.rerun()
-        return
+    with st.expander("🔐 用户登录 / 注册", expanded=True):
+        tabs = st.tabs(["登录", "注册"])
 
-    tabs = st.sidebar.tabs(["登录", "注册"])
+        with tabs[0]:
+            u = st.text_input("用户名（字母/数字/下划线）", key="login_user_top")
+            p = st.text_input("密码", type="password", key="login_pass_top")
+            remember = st.checkbox("保持登录（30天）", value=True)
 
-    with tabs[0]:
-        u = st.text_input("用户名", key="login_user")
-        p = st.text_input("密码", type="password", key="login_pass")
-        if st.button("登录", key="login_btn"):
-            uu = normalize_username(u)
-            if not uu:
-                st.sidebar.error("用户名只能包含字母/数字/下划线")
-                return
-            if uu not in db:
-                st.sidebar.error("用户不存在")
-                return
-            rec = db[uu]
-            if verify_password(p, rec["salt"], rec["hash"]):
-                st.session_state.authed_user = uu
-                load_user_state(uu)
-                st.rerun()
-            else:
-                st.sidebar.error("密码错误")
+            if st.button("登录", key="login_btn_top"):
+                uu = normalize_username(u)
+                if not uu:
+                    st.error("用户名只能包含字母/数字/下划线")
+                    return
+                if uu not in db:
+                    st.error("用户不存在")
+                    return
+                rec = db[uu]
+                if verify_password(p, rec["salt"], rec["hash"]):
+                    ensure_user_storage(uu)
+                    login(uu)
 
-    with tabs[1]:
-        u = st.text_input("新用户名（字母/数字/下划线）", key="reg_user")
-        p1 = st.text_input("新密码", type="password", key="reg_pass1")
-        p2 = st.text_input("确认密码", type="password", key="reg_pass2")
-        if st.button("注册", key="reg_btn"):
-            uu = normalize_username(u)
-            if not uu:
-                st.sidebar.error("用户名只能包含字母/数字/下划线")
-                return
-            if uu in db:
-                st.sidebar.error("用户名已存在")
-                return
-            if len(p1) < 6:
-                st.sidebar.error("密码至少 6 位")
-                return
-            if p1 != p2:
-                st.sidebar.error("两次密码不一致")
-                return
+                    if remember:
+                        raw_token = create_or_rotate_session_token(db, uu)
+                        cookie_set(COOKIE_NAME, make_session_cookie_value(uu, raw_token), days=30)
 
-            h = pbkdf2_hash_password(p1)
-            db[uu] = {"salt": h["salt"], "hash": h["hash"], "created_at": datetime.now().isoformat()}
-            save_auth_db(db)
+                    st.session_state.show_login = False
+                    st.success("✅ 登录成功")
+                    st.rerun()
+                else:
+                    st.error("密码错误")
 
-            # init user storage
-            ud = user_dir(uu)
-            (ud / "records.csv").write_text(",".join(RECORD_COLS) + "\n", encoding="utf-8")
-            (ud / "budgets.csv").write_text(",".join(BUDGET_COLS) + "\n", encoding="utf-8")
-            (ud / "config.json").write_text(json.dumps({"init_balance": 0.0}), encoding="utf-8")
+        with tabs[1]:
+            u = st.text_input("新用户名（字母/数字/下划线）", key="reg_user_top")
+            p1 = st.text_input("新密码（>=6位）", type="password", key="reg_pass1_top")
+            p2 = st.text_input("确认密码", type="password", key="reg_pass2_top")
+            if st.button("注册", key="reg_btn_top"):
+                uu = normalize_username(u)
+                if not uu:
+                    st.error("用户名只能包含字母/数字/下划线")
+                    return
+                if uu in db:
+                    st.error("用户名已存在")
+                    return
+                if len(p1) < 6:
+                    st.error("密码至少 6 位")
+                    return
+                if p1 != p2:
+                    st.error("两次密码不一致")
+                    return
 
-            st.sidebar.success("✅ 注册成功！请返回「登录」登录使用")
+                h = pbkdf2_hash_password(p1)
+                db[uu] = {"salt": h["salt"], "hash": h["hash"], "created_at": datetime.now().isoformat()}
+                save_auth_db(db)
+
+                ensure_user_storage(uu)
+                st.success("✅ 注册成功，请切换到「登录」进行登录。")
 
 
 # =================================
-# 5) Run auth first
+# 6) Render top bar + auto login
 # =================================
-auth_panel()
+if "authed_user" not in st.session_state:
+    st.session_state.authed_user = None
+if "show_login" not in st.session_state:
+    st.session_state.show_login = False
+
+top_login_bar()
+st.divider()
+
+# attempt auto-login via cookie
+try_cookie_auto_login()
+
+# show login panel if needed
+login_panel()
 
 if not st.session_state.get("authed_user"):
-    st.title("💰 私人理财中心（多用户）")
-    st.info("请先在左侧登录/注册后使用。")
+    st.info("请点击右上角「登录 / 注册」后使用。")
     st.stop()
 
 USERNAME = st.session_state.authed_user
 
-# Ensure state exists (in case of rerun)
+# ensure user state loaded
 if "records" not in st.session_state:
     load_user_state(USERNAME)
 
 # =================================
-# 6) Sidebar: new record
+# 7) Sidebar input
 # =================================
 st.sidebar.header("📝 记账录入")
 
@@ -325,9 +529,9 @@ with st.sidebar.form("record_form", clear_on_submit=True):
             st.sidebar.error("金额输入有误")
 
 # =================================
-# 7) Dashboard
+# 8) Dashboard
 # =================================
-st.title(f"💰 我的财务一体化看板（用户：{USERNAME}）")
+st.title(f"📊 财务看板")
 
 df0 = enrich_records(st.session_state.records)
 inc = df0[df0["类型"] == "收入"]["金额"].sum() if not df0.empty else 0.0
@@ -339,10 +543,7 @@ c1.metric("目前总结余", f"¥ {bal:,.2f}")
 c2.metric("累计总收入", f"¥ {inc:,.2f}")
 c3.metric("累计总支出", f"¥ {exp:,.2f}", delta=f"-{exp:,.2f}")
 
-# =================================
-# 8) Tabs
-# =================================
-tab1, tab2 = st.tabs(["📋 明细（行内修改/删除）", "📈 理财中心（统计/导入）"])
+tab1, tab2 = st.tabs(["📋 明细（行内修改/删除）", "📈 统计/导入/个人设置"])
 
 # -------- Tab1: inline edit/delete
 with tab1:
@@ -408,7 +609,6 @@ with tab1:
             )
 
             colA, colB, colC = st.columns([1.3, 1.3, 2.4])
-
             with colA:
                 if st.button("💾 保存修改", type="primary"):
                     edited2 = prepare_for_editor(edited.drop(columns=["🗑 删除"], errors="ignore"))
@@ -447,7 +647,7 @@ with tab1:
                     mime="text/csv"
                 )
 
-# -------- Tab2: import + stats
+# -------- Tab2: stats + import + profile + remember-me control
 with tab2:
     st.subheader("📊 统计中心（按年/月/区间）")
     df = enrich_records(prepare_for_editor(st.session_state.records))
@@ -497,19 +697,13 @@ with tab2:
             st.line_chart(mwide)
 
     st.divider()
-    st.subheader("📥 数据导入（当前用户：只导入到自己的账本）")
-
-    up = st.file_uploader("上传 CSV（列名：日期/账本/类别/项目/金额/类型）", type=["csv"])
+    st.subheader("📥 导入（只导入到当前登录用户）")
+    up = st.file_uploader("上传 CSV（列：日期/账本/类别/项目/金额/类型）", type=["csv"])
     if up is not None:
         try:
             df_in = pd.read_csv(up)
             st.dataframe(df_in.head(20), use_container_width=True)
-
             if st.button("✅ 导入到我的账本"):
-                # 容错映射
-                col_map = {c: c.strip() for c in df_in.columns}
-                df_in.rename(columns=col_map, inplace=True)
-
                 tmp = pd.DataFrame()
                 tmp["日期"] = pd.to_datetime(df_in.get("日期"), errors="coerce")
                 tmp = tmp.dropna(subset=["日期"])
@@ -518,10 +712,9 @@ with tab2:
                 tmp["账本"] = df_in.get("账本", "生活主账")
                 tmp["类别"] = df_in.get("类别", "其他")
                 tmp["项目"] = df_in.get("项目", "")
-                tmp["金额"] = df_in.get("金额", 0).astype(str).apply(parse_amount)
+                tmp["金额"] = df_in.get("金额", 0).astype(str).apply(parse_amount).abs()
                 tmp["类型"] = df_in.get("类型", "").astype(str).apply(normalize_type)
                 tmp.loc[~tmp["类型"].isin(["收入", "支出"]), "类型"] = "支出"
-                tmp["金额"] = tmp["金额"].abs()
 
                 start = next_id()
                 tmp.insert(0, "ID", range(start, start + len(tmp)))
@@ -529,23 +722,48 @@ with tab2:
 
                 st.session_state.records = prepare_for_editor(pd.concat([prepare_for_editor(st.session_state.records), tmp], ignore_index=True))
                 persist_user_state(USERNAME)
-                st.success(f"✅ 已导入 {len(tmp)} 条到你的账户")
+                st.success(f"✅ 已导入 {len(tmp)} 条")
                 st.rerun()
-
         except Exception as e:
             st.error(f"导入失败：{e}")
 
-# =================================
-# 9) Settings
-# =================================
-with st.expander("⚙️ 账户配置（仅影响当前用户）"):
-    new_init = st.number_input("设置起始资金", value=float(st.session_state.init_balance))
-    if new_init != st.session_state.init_balance:
-        st.session_state.init_balance = float(new_init)
-        persist_user_state(USERNAME)
-        st.success("起始资金已保存。")
+    st.divider()
+    st.subheader("👤 个人设置（头像 / 昵称 / 起始资金 / 登录持久化）")
 
-    if st.button("🚨 清空我的所有记录（不可逆）"):
-        st.session_state.records = pd.DataFrame(columns=RECORD_COLS)
-        persist_user_state(USERNAME)
-        st.rerun()
+    cfg = load_user_config(USERNAME)
+
+    # avatar & nickname
+    new_avatar = st.text_input("头像（建议输入一个 emoji）", value=st.session_state.get("avatar", cfg.get("avatar", "🙂")))
+    new_nickname = st.text_input("昵称（显示在右上角）", value=st.session_state.get("nickname", cfg.get("nickname", USERNAME)))
+
+    new_init = st.number_input("起始资金", value=float(st.session_state.init_balance))
+
+    colx, coly = st.columns([1.3, 1.7])
+    with colx:
+        if st.button("💾 保存个人设置", type="primary"):
+            # update session
+            st.session_state.avatar = new_avatar.strip() if new_avatar.strip() else "🙂"
+            st.session_state.nickname = new_nickname.strip() if new_nickname.strip() else USERNAME
+            st.session_state.init_balance = float(new_init)
+
+            # save to user config
+            cfg["avatar"] = st.session_state.avatar
+            cfg["nickname"] = st.session_state.nickname
+            cfg["init_balance"] = float(st.session_state.init_balance)
+            save_user_config(USERNAME, cfg)
+
+            # also persist files
+            persist_user_state(USERNAME)
+            st.success("✅ 已保存（右上角会更新）")
+            st.rerun()
+
+    with coly:
+        st.caption("登录持久化：如果你不想自动登录，可以清除“保持登录”状态。")
+        if st.button("🧹 清除保持登录（本机不再自动登录）"):
+            # rotate server token to invalidate cookie
+            db = load_auth_db()
+            if USERNAME in db:
+                db[USERNAME]["session_token_hash"] = ""
+                save_auth_db(db)
+            cookie_delete(COOKIE_NAME)
+            st.success("✅ 已清除保持登录（下次需要重新登录）")
