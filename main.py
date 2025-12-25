@@ -1,29 +1,68 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 import re
+import json
+from pathlib import Path
 
 # =========================
 # 0) Page
 # =========================
 st.set_page_config(page_title="私人理财中心", layout="wide")
 
+# =========================
+# 1) 本地持久化（关键：改代码/重启不丢数据）
+# =========================
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+RECORDS_PATH = DATA_DIR / "records.csv"
+BUDGETS_PATH = DATA_DIR / "budgets.csv"
+CONFIG_PATH = DATA_DIR / "config.json"
+
+RECORD_COLS = ["ID", "日期", "账本", "类别", "项目", "金额", "类型"]
+BUDGET_COLS = ["年月", "类别", "类型", "预算金额"]
+
+
+def load_csv(path: Path, cols: list[str]) -> pd.DataFrame:
+    if path.exists():
+        df = pd.read_csv(path)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        return df[cols]
+    return pd.DataFrame(columns=cols)
+
+
+def persist_all():
+    """把当前 session_state 写入磁盘"""
+    st.session_state.records.to_csv(RECORDS_PATH, index=False, encoding="utf-8-sig")
+    st.session_state.budgets.to_csv(BUDGETS_PATH, index=False, encoding="utf-8-sig")
+    CONFIG_PATH.write_text(
+        json.dumps({"init_balance": st.session_state.init_balance}, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
 
 # =========================
-# 1) Session State
+# 2) Session State（启动自动从磁盘读取）
 # =========================
 if "records" not in st.session_state:
-    st.session_state.records = pd.DataFrame(columns=["ID", "日期", "账本", "类别", "项目", "金额", "类型"])
-
-if "init_balance" not in st.session_state:
-    st.session_state.init_balance = 0.0
+    st.session_state.records = load_csv(RECORDS_PATH, RECORD_COLS)
 
 if "budgets" not in st.session_state:
-    st.session_state.budgets = pd.DataFrame(columns=["年月", "类别", "类型", "预算金额"])
+    st.session_state.budgets = load_csv(BUDGETS_PATH, BUDGET_COLS)
+
+if "init_balance" not in st.session_state:
+    if CONFIG_PATH.exists():
+        st.session_state.init_balance = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("init_balance", 0.0)
+    else:
+        st.session_state.init_balance = 0.0
 
 
 # =========================
-# 2) Helpers
+# 3) Helpers
 # =========================
 def parse_amount(s: str) -> float:
     """安全解析金额：支持 1,234 / $120 / -30 / 空值"""
@@ -38,14 +77,9 @@ def parse_amount(s: str) -> float:
 
 def normalize_type(t: str) -> str:
     t = (t or "").strip().lower()
-    if t in ["收入", "income", "in", "+", "earning", "earnings"]:
+    if t in ["收入", "income", "in", "+", "earning", "earnings", "收"]:
         return "收入"
-    if t in ["支出", "expense", "out", "-", "spend", "spending"]:
-        return "支出"
-    # 允许用户写“收/支”
-    if t in ["收"]:
-        return "收入"
-    if t in ["支"]:
+    if t in ["支出", "expense", "out", "-", "spend", "spending", "支"]:
         return "支出"
     return ""
 
@@ -63,7 +97,6 @@ def enrich_records(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def guess_type_and_amount(line: str):
-    """从备忘录单行猜测类型与金额"""
     s = (line or "").strip()
     if not s:
         return "", None
@@ -78,7 +111,6 @@ def guess_type_and_amount(line: str):
     amt = None
     if nums:
         amt = parse_amount(nums[-1])
-        # 避免年份被误判为金额
         if amt and 1900 <= amt <= 2100 and len(nums) >= 2:
             amt = parse_amount(nums[-2])
 
@@ -93,10 +125,7 @@ def guess_type_and_amount(line: str):
 
 def parse_memo_text_to_df(text: str) -> pd.DataFrame:
     """
-    支持：
-    2025-09-19 支出 Eat outside 午饭 35
-    2025/09/20 工资 3000 收入
-    9.19 120   （如果没年，会解析成当年是不安全的，建议你粘贴带年份；否则可在导入器里加规则）
+    粘贴导入文本：要求每行至少包含【YYYY-MM-DD】或【YYYY/MM/DD】+ 金额
     """
     rows = []
     for raw in (text or "").splitlines():
@@ -104,10 +133,8 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
         if not line:
             continue
 
-        # 找日期（优先 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD）
         date_match = re.search(r"(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})", line)
         if not date_match:
-            # 没年份的日期（如 9.19）这份导入器先不自动导入，避免错年
             continue
 
         d = pd.to_datetime(date_match.group(1), errors="coerce")
@@ -121,15 +148,12 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
 
         book = "生活主账"
         cat = "其他"
-        item = ""
 
-        # 账本识别
         for b in ["生活主账", "车子专项", "学费/购汇", "理财账本"]:
             if b in line:
                 book = b
                 break
 
-        # 类别识别（可按你自己的类别继续扩展）
         exp_cats = ["Eat outside", "Shopping", "Bill", "Petrol", "Insurance", "Rent"]
         inc_cats = ["工资", "业余项目", "亲情赠与", "理财收益"]
         for c in exp_cats + inc_cats:
@@ -137,18 +161,16 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
                 cat = c
                 break
 
-        # 去掉日期、金额后的文本当备注
         tmp = re.sub(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", line).strip()
         tmp = re.sub(r"[-+]?\d[\d,]*\.?\d*", "", tmp).strip()
         item = re.sub(r"\s+", " ", tmp)
 
-        # 类型兜底：没识别出来就按金额符号/类别
         if t == "" and cat in inc_cats:
             t = "收入"
         if t == "" and cat in exp_cats:
             t = "支出"
         if t == "":
-            t = "支出"  # 保守兜底
+            t = "支出"
 
         rows.append({
             "日期": d,
@@ -163,7 +185,7 @@ def parse_memo_text_to_df(text: str) -> pd.DataFrame:
 
 
 # =========================
-# 3) Sidebar Input
+# 4) Sidebar Input
 # =========================
 st.sidebar.header("📝 记账录入")
 
@@ -200,13 +222,14 @@ with st.sidebar.form("record_form", clear_on_submit=True):
                 "类型": t_type
             }
             st.session_state.records = pd.concat([st.session_state.records, pd.DataFrame([new_row])], ignore_index=True)
+            persist_all()  # ✅ 持久化
             st.sidebar.success(f"✅ 已记录{t_type}：{final_cat} ¥{amt:,.2f}")
         except Exception:
             st.sidebar.error("金额输入有误")
 
 
 # =========================
-# 4) Dashboard
+# 5) Dashboard
 # =========================
 st.title("💰 我的财务一体化看板")
 
@@ -223,7 +246,7 @@ c3.metric("累计总支出", f"¥ {exp:,.2f}", delta=f"-{exp:,.2f}")
 
 
 # =========================
-# 5) Tabs
+# 6) Tabs
 # =========================
 tab1, tab2 = st.tabs(["📋 历史明细与删除", "📈 理财中心（统计/导入/预算）"])
 
@@ -232,23 +255,18 @@ with tab1:
     if not df0.empty:
         st.dataframe(df0.sort_values("ID", ascending=False), use_container_width=True)
         st.divider()
+
         st.write("🗑️ **删除错误记录**")
         target_id = st.selectbox("选择要删除的记录 ID", options=df0["ID"].tolist())
         if st.button("🔴 确认删除该记录"):
             st.session_state.records = st.session_state.records[st.session_state.records["ID"] != target_id]
+            persist_all()  # ✅ 持久化
             st.rerun()
     else:
         st.info("尚无记录，请在左侧录入")
 
 # ---- Tab2: Finance Center
 with tab2:
-    st.subheader("📈 理财中心")
-    st.link_button("🚀 前往养基宝查看实时持仓", "https://wx.yangjibao.com/app/hold")
-    st.divider()
-
-    # =========================
-    # 5.1 Import Center  ✅ 你要的导入功能就在这里
-    # =========================
     st.subheader("📥 数据导入（CSV/Excel/备忘录文本）")
 
     imp_tab1, imp_tab2, imp_tab3 = st.tabs(["上传CSV/Excel", "粘贴备忘录文本", "模板下载"])
@@ -265,7 +283,7 @@ with tab2:
                 st.write("预览：")
                 st.dataframe(df_in.head(30), use_container_width=True)
 
-                st.info("在下方映射列名到系统字段（列名不一致也没关系）。")
+                st.info("映射列名到系统字段（列名不一致也没关系）。")
 
                 cols = df_in.columns.tolist()
                 m1, m2, m3 = st.columns(3)
@@ -289,12 +307,10 @@ with tab2:
 
                     if col_type != "<无>":
                         tmp["类型"] = df_in.loc[tmp.index, col_type].astype(str).apply(normalize_type)
+                        tmp = tmp[tmp["类型"].isin(["收入", "支出"])]
                     else:
-                        # 没有类型列：金额<0 当支出，否则收入
                         tmp["类型"] = tmp["金额"].apply(lambda x: "支出" if x < 0 else "收入")
                         tmp["金额"] = tmp["金额"].abs()
-
-                    tmp = tmp[tmp["类型"].isin(["收入", "支出"])]
 
                     if col_cat != "<无>":
                         tmp["类别"] = df_in.loc[tmp.index, col_cat].astype(str).replace({"": "其他"}).fillna("其他")
@@ -315,17 +331,18 @@ with tab2:
 
                     start_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
                     tmp.insert(0, "ID", range(start_id, start_id + len(tmp)))
-                    tmp = tmp[["ID", "日期", "账本", "类别", "项目", "金额", "类型"]]
+                    tmp = tmp[RECORD_COLS]
 
                     st.session_state.records = pd.concat([st.session_state.records, tmp], ignore_index=True)
-                    st.success(f"✅ 已导入 {len(tmp)} 条记录")
+                    persist_all()  # ✅ 持久化
+                    st.success(f"✅ 已导入 {len(tmp)} 条记录（已自动保存到 data/records.csv）")
                     st.rerun()
 
             except Exception as e:
                 st.error(f"导入失败：{e}")
 
     with imp_tab2:
-        st.caption("直接粘贴备忘录多行文本。每行尽量包含：年份日期 + 金额（类型/类别/备注可选）。")
+        st.caption("每行至少包含：年份日期 + 金额（如 2025-12-01 支出 Rent 500）")
         memo = st.text_area(
             "粘贴区域",
             height=220,
@@ -342,10 +359,11 @@ with tab2:
 
                 start_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
                 df_m.insert(0, "ID", range(start_id, start_id + len(df_m)))
-                df_m = df_m[["ID", "日期", "账本", "类别", "项目", "金额", "类型"]]
+                df_m = df_m[RECORD_COLS]
 
                 st.session_state.records = pd.concat([st.session_state.records, df_m], ignore_index=True)
-                st.success(f"✅ 已导入 {len(df_m)} 条记录")
+                persist_all()  # ✅ 持久化
+                st.success(f"✅ 已导入 {len(df_m)} 条记录（已自动保存到 data/records.csv）")
                 st.rerun()
 
     with imp_tab3:
@@ -360,7 +378,7 @@ with tab2:
     st.divider()
 
     # =========================
-    # 5.2 Statistics
+    # 统计中心
     # =========================
     st.subheader("📊 统计中心（按年/月/日期区间）")
 
@@ -443,16 +461,18 @@ with tab2:
     st.divider()
 
     # =========================
-    # 5.3 Budget
+    # 预算（可选）
     # =========================
     st.subheader("🎯 预算（可选）")
 
     left, right = st.columns([1.2, 2.8])
     with left:
         st.markdown("**录入/更新预算**")
-        all_ym = sorted(df0["年月"].unique().tolist()) if not df0.empty and "年月" in df0.columns else []
-        bud_ym = st.selectbox("预算年月", all_ym if all_ym else ["2025-12"])
-        all_cats = sorted(df0["类别"].unique().tolist()) if not df0.empty else ["其他"]
+        df_now = enrich_records(st.session_state.records)
+        all_ym = sorted(df_now["年月"].unique().tolist()) if not df_now.empty else ["2025-12"]
+        all_cats = sorted(df_now["类别"].unique().tolist()) if not df_now.empty else ["其他"]
+
+        bud_ym = st.selectbox("预算年月", all_ym)
         bud_cat = st.selectbox("预算类别", all_cats)
         bud_type = st.selectbox("预算类型", ["支出", "收入"], index=0)
         bud_amt_str = st.text_input("预算金额", placeholder="例如 2000")
@@ -463,9 +483,13 @@ with tab2:
             mask = (bud_df["年月"] == bud_ym) & (bud_df["类别"] == bud_cat) & (bud_df["类型"] == bud_type)
             bud_df = bud_df[~mask]
             bud_df = pd.concat([bud_df, pd.DataFrame([{
-                "年月": bud_ym, "类别": bud_cat, "类型": bud_type, "预算金额": float(bud_amt)
+                "年月": bud_ym,
+                "类别": bud_cat,
+                "类型": bud_type,
+                "预算金额": float(bud_amt)
             }])], ignore_index=True)
             st.session_state.budgets = bud_df
+            persist_all()  # ✅ 持久化
             st.success(f"已保存预算：{bud_ym}/{bud_cat}/{bud_type}=¥{bud_amt:,.2f}")
 
     with right:
@@ -494,12 +518,35 @@ with tab2:
             else:
                 st.info("请选择至少一个年月查看预算对比。")
 
+    st.divider()
+
+    # ✅ 紧急备份按钮（任何时候都能导出）
+    st.subheader("🛟 紧急备份（建议你现在点一次）")
+    st.download_button(
+        "⬇️ 下载当前 records 备份（records_backup.csv）",
+        data=st.session_state.records.to_csv(index=False).encode("utf-8-sig"),
+        file_name="records_backup.csv",
+        mime="text/csv"
+    )
+    st.caption("本地也已自动保存到 data/records.csv；这个按钮是额外保险。")
+
 
 # =========================
-# 6) Settings
+# 7) Settings
 # =========================
 with st.expander("⚙️ 账户配置"):
-    st.session_state.init_balance = st.number_input("1. 设置起始资金", value=st.session_state.init_balance)
-    if st.button("🚨 清空所有记录"):
-        st.session_state.records = pd.DataFrame(columns=["ID", "日期", "账本", "类别", "项目", "金额", "类型"])
-        st.rerun()
+    new_init = st.number_input("1. 设置起始资金", value=float(st.session_state.init_balance))
+    if new_init != st.session_state.init_balance:
+        st.session_state.init_balance = float(new_init)
+        persist_all()  # ✅ 持久化
+
+    colx, coly = st.columns(2)
+    with colx:
+        if st.button("💾 手动保存到本地（写入 data/records.csv）"):
+            persist_all()
+            st.success("已保存。")
+    with coly:
+        if st.button("🚨 清空所有记录（不可逆）"):
+            st.session_state.records = pd.DataFrame(columns=RECORD_COLS)
+            persist_all()  # ✅ 持久化
+            st.rerun()
