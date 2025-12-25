@@ -38,6 +38,128 @@ def enrich_records(df: pd.DataFrame) -> pd.DataFrame:
     out["年月"] = out["日期"].dt.to_period("M").astype(str)
     return out
 
+import io
+
+def normalize_type(t: str) -> str:
+    t = (t or "").strip().lower()
+    if t in ["收入", "income", "in", "+", "earning", "earnings"]:
+        return "收入"
+    if t in ["支出", "expense", "out", "-", "spend", "spending"]:
+        return "支出"
+    return ""
+
+def parse_date_any(x):
+    # 尝试多种日期格式
+    try:
+        return pd.to_datetime(x, errors="coerce").date()
+    except:
+        return None
+
+def guess_type_and_amount(line: str):
+    # 从一行文本里猜测收入/支出 和 金额
+    s = (line or "").strip()
+    if not s:
+        return "", None
+
+    # 类型判断：含关键字，或金额前缀符号
+    t = ""
+    if any(k in s for k in ["收入", "income", "到账", "工资", "入账", "+"]):
+        t = "收入"
+    if any(k in s for k in ["支出", "expense", "消费", "付款", "花了", "转出", "-"]):
+        # 若同时出现，以“支出”为优先（更保守）
+        t = "支出"
+
+    # 金额：取最后一个像数字的片段（避免日期被当金额）
+    nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", s)
+    amt = None
+    if nums:
+        # 取最大可能为金额的（通常最后一个）
+        amt = parse_amount(nums[-1])
+        # 如果识别成 2024 这类年份，且前面还有数字，尝试取更靠后的
+        if amt and amt >= 1900 and amt <= 2100 and len(nums) >= 2:
+            amt = parse_amount(nums[-2])
+
+    # 若类型仍未知：看金额符号
+    if t == "" and nums:
+        if nums[-1].startswith("-"):
+            t = "支出"
+        elif nums[-1].startswith("+"):
+            t = "收入"
+
+    return t, amt
+
+def parse_memo_text_to_df(text: str) -> pd.DataFrame:
+    """
+    支持类似：
+    2024-03-01 支出 Eat outside 午饭 35
+    2024/03/02 income 工资 8000
+    3.5 Rent -1200
+    2024-03-03 车子专项 Petrol 80 支出
+    或者更随意的：日期/描述/金额混在一起
+    """
+    rows = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        # 先找日期（行里任意位置）
+        date_match = re.search(r"(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})", line)
+        d = parse_date_any(date_match.group(1)) if date_match else None
+        if d is None:
+            # 没日期就跳过（或你也可以默认今天）
+            continue
+
+        t, amt = guess_type_and_amount(line)
+        if amt is None:
+            continue
+
+        # 默认值
+        book = "生活主账"
+        cat = "其他"
+        item = ""
+
+        # 粗略拆分：去掉日期和金额部分后，剩下当备注
+        line_wo_date = re.sub(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", "", line).strip()
+        # 去掉金额数字
+        line_wo_amt = re.sub(r"[-+]?\d[\d,]*\.?\d*", "", line_wo_date).strip()
+        item = re.sub(r"\s+", " ", line_wo_amt)
+
+        # 尝试从文本中抓“账本/类别”（如果你文本里有这些关键词）
+        # 账本：匹配你系统的四类
+        for b in ["生活主账", "车子专项", "学费/购汇", "理财账本"]:
+            if b in line:
+                book = b
+                break
+
+        # 类别：支出/收入各自类别表
+        exp_cats = ["Eat outside", "Shopping", "Bill", "Petrol", "Insurance", "Rent"]
+        inc_cats = ["工资", "业余项目", "亲情赠与", "理财收益"]
+        for c in exp_cats + inc_cats:
+            if c in line:
+                cat = c
+                break
+
+        # 如果类型还没猜出来：按类别兜底
+        if t == "" and cat in inc_cats:
+            t = "收入"
+        if t == "" and cat in exp_cats:
+            t = "支出"
+        if t == "":
+            # 最后兜底：金额为正默认支出（更保守），你也可以反过来
+            t = "支出"
+
+        rows.append({
+            "日期": d,
+            "账本": book,
+            "类别": cat,
+            "项目": item,
+            "金额": float(abs(amt)) if t == "支出" else float(abs(amt)),
+            "类型": t
+        })
+
+    return pd.DataFrame(rows)
+
 
 # --- 2. 侧边栏：实时联动逻辑 ---
 st.sidebar.header("📝 记账录入")
@@ -81,6 +203,113 @@ with st.sidebar.form("record_form", clear_on_submit=True):
             st.sidebar.success(f"✅ 已记录{t_type}：{final_cat}  ¥{amt:,.2f}")
         except Exception:
             st.sidebar.error("金额输入有误，请重新输入（如 12.5 或 1200）")
+
+st.divider()
+st.subheader("📥 数据导入（CSV/Excel/备忘录文本）")
+
+imp_tab1, imp_tab2, imp_tab3 = st.tabs(["上传CSV/Excel", "粘贴备忘录文本", "模板下载"])
+
+with imp_tab1:
+    up = st.file_uploader("上传文件（CSV / XLSX）", type=["csv", "xlsx"])
+    if up is not None:
+        try:
+            if up.name.endswith(".csv"):
+                df_in = pd.read_csv(up)
+            else:
+                df_in = pd.read_excel(up)
+
+            st.write("预览：")
+            st.dataframe(df_in.head(20), use_container_width=True)
+
+            st.info("请在下方映射列名到系统字段（你的原数据列名不一致也没关系）。")
+
+            cols = df_in.columns.tolist()
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                col_date = st.selectbox("日期列", cols)
+                col_amt  = st.selectbox("金额列", cols)
+            with m2:
+                col_type = st.selectbox("类型列（收入/支出，可选）", ["<无>"] + cols)
+                col_cat  = st.selectbox("类别列（可选）", ["<无>"] + cols)
+            with m3:
+                col_book = st.selectbox("账本列（可选）", ["<无>"] + cols)
+                col_item = st.selectbox("项目/备注列（可选）", ["<无>"] + cols)
+
+            if st.button("✅ 解析并导入", key="import_file_btn"):
+                tmp = pd.DataFrame()
+                tmp["日期"] = pd.to_datetime(df_in[col_date], errors="coerce").dt.date
+                tmp["金额"] = df_in[col_amt].astype(str).apply(parse_amount)
+
+                if col_type != "<无>":
+                    tmp["类型"] = df_in[col_type].astype(str).apply(normalize_type)
+                else:
+                    # 没有类型列就默认：金额<0为支出，否则收入（你也可改成全部支出）
+                    tmp["类型"] = tmp["金额"].apply(lambda x: "支出" if x < 0 else "收入")
+                    tmp["金额"] = tmp["金额"].abs()
+
+                if col_cat != "<无>":
+                    tmp["类别"] = df_in[col_cat].astype(str).replace({"": "其他"}).fillna("其他")
+                else:
+                    tmp["类别"] = "其他"
+
+                if col_book != "<无>":
+                    tmp["账本"] = df_in[col_book].astype(str).replace({"": "生活主账"}).fillna("生活主账")
+                else:
+                    tmp["账本"] = "生活主账"
+
+                if col_item != "<无>":
+                    tmp["项目"] = df_in[col_item].astype(str).fillna("")
+                else:
+                    tmp["项目"] = ""
+
+                # 清洗掉无日期/无金额/无类型的行
+                tmp = tmp.dropna(subset=["日期"])
+                tmp = tmp[tmp["类型"].isin(["收入", "支出"])]
+                tmp["金额"] = tmp["金额"].abs()
+
+                # 生成 ID 并合并进 records
+                start_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
+                tmp.insert(0, "ID", range(start_id, start_id + len(tmp)))
+
+                # 列顺序对齐
+                tmp = tmp[["ID", "日期", "账本", "类别", "项目", "金额", "类型"]]
+
+                st.session_state.records = pd.concat([st.session_state.records, tmp], ignore_index=True)
+                st.success(f"✅ 已导入 {len(tmp)} 条记录")
+                st.rerun()
+
+        except Exception as e:
+            st.error(f"导入失败：{e}")
+
+with imp_tab2:
+    st.caption("把备忘录里的多行文本直接粘贴进来。每行尽量包含：日期 + 金额（类型/类别/备注可有可无）。")
+    memo = st.text_area("粘贴区域", height=200, placeholder="例：\n2024-03-01 支出 Eat outside 午饭 35\n2024/03/02 工资 8000 收入\n2024-03-03 车子专项 Petrol 80 支出")
+    if st.button("✅ 解析文本并导入", key="import_memo_btn"):
+        df_m = parse_memo_text_to_df(memo)
+        if df_m.empty:
+            st.warning("没有解析出有效记录。请确保每行至少包含：日期 + 金额。")
+        else:
+            st.write("解析预览：")
+            st.dataframe(df_m.head(50), use_container_width=True)
+
+            # 确认导入（不需要二次确认也可直接导入，这里给你更稳）
+            if st.button("➡️ 确认写入账本", key="confirm_import_memo"):
+                start_id = int(st.session_state.records["ID"].max() + 1) if not st.session_state.records.empty else 1
+                df_m.insert(0, "ID", range(start_id, start_id + len(df_m)))
+                df_m = df_m[["ID", "日期", "账本", "类别", "项目", "金额", "类型"]]
+                st.session_state.records = pd.concat([st.session_state.records, df_m], ignore_index=True)
+                st.success(f"✅ 已导入 {len(df_m)} 条记录")
+                st.rerun()
+
+with imp_tab3:
+    st.write("你可以先下载模板，按模板填好再上传导入。")
+    template = pd.DataFrame(columns=["日期", "账本", "类别", "项目", "金额", "类型"])
+    st.download_button(
+        "⬇️ 下载 CSV 模板",
+        data=template.to_csv(index=False).encode("utf-8-sig"),
+        file_name="import_template.csv",
+        mime="text/csv"
+    )
 
 
 # --- 3. 汇总看板 ---
