@@ -1,14 +1,11 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import date
 import re, secrets, hashlib, hmac
-import psycopg
-import psycopg.rows
+import psycopg2
+import psycopg2.extras
 import streamlit.components.v1 as components
 
-# =========================================================
-# Config
-# =========================================================
 st.set_page_config(page_title="私人理财中心（公网多用户）", layout="wide")
 
 APP_SECRET = st.secrets["APP_SECRET"]
@@ -20,26 +17,27 @@ BOOK_OPTIONS = ["生活主账", "车子专项", "学费/购汇", "理财账本"]
 EXP_CATS = ["Eat outside", "Shopping", "Bill", "Petrol", "Insurance", "Rent", "其他"]
 INC_CATS = ["工资", "业余项目", "亲情赠与", "理财收益", "其他"]
 
-# =========================================================
-# DB
-# =========================================================
+
+# ---------------- DB ----------------
 @st.cache_resource
 def get_conn():
-    return psycopg.connect(DATABASE_URL, row_factory=psycopg.rows.dict_row)
+    # DictCursor so rows become dict
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def db_fetchall(sql, params=None):
-    with get_conn().cursor() as cur:
+    conn = get_conn()
+    with conn.cursor() as cur:
         cur.execute(sql, params or [])
         return cur.fetchall()
 
 def db_execute(sql, params=None):
-    with get_conn().cursor() as cur:
+    conn = get_conn()
+    with conn.cursor() as cur:
         cur.execute(sql, params or [])
-    get_conn().commit()
+    conn.commit()
 
-# =========================================================
-# Security
-# =========================================================
+
+# ---------------- Security ----------------
 def normalize_username(u: str) -> str:
     u = (u or "").strip()
     u = re.sub(r"[^A-Za-z0-9_]", "", u)
@@ -61,9 +59,8 @@ def hmac_sign(s: str) -> str:
 def sha256_token(raw: str) -> str:
     return hashlib.sha256((raw + APP_SECRET).encode("utf-8")).hexdigest()
 
-# =========================================================
-# Cookie helpers (JS)
-# =========================================================
+
+# ---------------- Cookies (JS) ----------------
 def cookie_get(name: str) -> str:
     html = f"""
     <script>
@@ -110,24 +107,24 @@ def parse_cookie_value(v: str):
     except:
         return None, None
 
-# =========================================================
-# User/profile
-# =========================================================
+
+# ---------------- Profile ----------------
 def get_user_profile(username: str):
     rows = db_fetchall("select username, nickname, avatar from users where username=%s", [username])
     if not rows:
         return {"username": username, "nickname": username, "avatar": "🙂"}
     r = rows[0]
-    nick = r["nickname"] if r["nickname"] else r["username"]
-    avatar = r["avatar"] if r["avatar"] else "🙂"
-    return {"username": r["username"], "nickname": nick, "avatar": avatar}
+    return {
+        "username": r["username"],
+        "nickname": r["nickname"] or r["username"],
+        "avatar": r["avatar"] or "🙂"
+    }
 
 def set_user_profile(username: str, nickname: str, avatar: str):
     db_execute("update users set nickname=%s, avatar=%s where username=%s", [nickname, avatar, username])
 
-# =========================================================
-# Auth flows
-# =========================================================
+
+# ---------------- Auth ----------------
 def login_as(username: str):
     st.session_state.authed_user = username
 
@@ -146,7 +143,7 @@ def verify_session_token(username: str, raw_token: str) -> bool:
     rows = db_fetchall("select session_token_hash from users where username=%s", [username])
     if not rows:
         return False
-    stored = rows[0]["session_token_hash"] or ""
+    stored = rows[0].get("session_token_hash") or ""
     if not stored:
         return False
     return hmac.compare_digest(stored, sha256_token(raw_token))
@@ -157,7 +154,6 @@ def try_auto_login_once():
     st.session_state["_cookie_checked"] = True
     if st.session_state.get("authed_user"):
         return
-
     v = cookie_get(COOKIE_NAME)
     if not v:
         return
@@ -172,9 +168,8 @@ def try_auto_login_once():
     else:
         cookie_delete(COOKIE_NAME)
 
-# =========================================================
-# Records helpers
-# =========================================================
+
+# ---------------- Records ----------------
 def parse_amount_any(x) -> float:
     if x is None:
         return 0.0
@@ -188,13 +183,14 @@ def parse_amount_any(x) -> float:
 
 def load_records(username: str) -> pd.DataFrame:
     rows = db_fetchall(
-        """select id, record_date, book, category, item, amount, rtype, created_at
-           from records where username=%s
+        """select id, record_date, book, category, item, amount, rtype
+           from records
+           where username=%s
            order by record_date desc, id desc""",
         [username]
     )
     if not rows:
-        return pd.DataFrame(columns=["id","record_date","book","category","item","amount","rtype","created_at"])
+        return pd.DataFrame(columns=["id","record_date","book","category","item","amount","rtype"])
     df = pd.DataFrame(rows)
     df["record_date"] = pd.to_datetime(df["record_date"])
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
@@ -208,8 +204,8 @@ def insert_record(username: str, d: date, book: str, cat: str, item: str, amt: f
     )
 
 def update_records_bulk(username: str, df: pd.DataFrame):
-    # df columns: id, record_date, book, category, item, amount, rtype
-    with get_conn().cursor() as cur:
+    conn = get_conn()
+    with conn.cursor() as cur:
         for _, r in df.iterrows():
             cur.execute(
                 """update records
@@ -226,19 +222,18 @@ def update_records_bulk(username: str, df: pd.DataFrame):
                     username
                 ]
             )
-    get_conn().commit()
+    conn.commit()
 
 def delete_records(username: str, ids: list[int]):
     if not ids:
         return
-    db_execute(
-        "delete from records where username=%s and id = any(%s)",
-        [username, ids]
-    )
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("delete from records where username=%s and id = any(%s)", [username, ids])
+    conn.commit()
 
-# =========================================================
-# UI: Top right login bar
-# =========================================================
+
+# ---------------- UI ----------------
 def top_bar():
     l, r = st.columns([6, 2])
     with l:
@@ -250,10 +245,10 @@ def top_bar():
                 f"<div style='text-align:right;font-size:14px'>{p['avatar']} <b>{p['nickname']}</b></div>",
                 unsafe_allow_html=True
             )
-            if st.button("退出", key="logout_btn_top"):
+            if st.button("退出", key="logout_top"):
                 logout()
         else:
-            if st.button("登录 / 注册", key="login_btn_top"):
+            if st.button("登录 / 注册", key="login_top"):
                 st.session_state.show_login = True
 
 def login_panel():
@@ -287,6 +282,7 @@ def login_panel():
                 if remember:
                     raw = rotate_session_token(uu)
                     cookie_set(COOKIE_NAME, make_cookie_value(uu, raw), days=COOKIE_DAYS)
+
                 st.session_state.show_login = False
                 st.rerun()
 
@@ -315,12 +311,11 @@ def login_panel():
                         [uu, hp["salt"], hp["hash"], uu, "🙂"]
                     )
                     st.success("✅ 注册成功，请切换到「登录」登录。")
-                except Exception as e:
+                except Exception:
                     st.error("注册失败：用户名可能已存在")
 
-# =========================================================
-# App start
-# =========================================================
+
+# ---------------- Start ----------------
 if "authed_user" not in st.session_state:
     st.session_state.authed_user = None
 if "show_login" not in st.session_state:
@@ -339,9 +334,8 @@ if not st.session_state.get("authed_user"):
 USERNAME = st.session_state.authed_user
 profile = get_user_profile(USERNAME)
 
-# =========================================================
-# Sidebar: record input
-# =========================================================
+
+# ---------------- Sidebar: add record ----------------
 st.sidebar.header("📝 记账录入")
 
 rtype = st.sidebar.selectbox("收支类型", ["支出", "收入"], key="rtype")
@@ -353,29 +347,23 @@ with st.sidebar.form("record_form", clear_on_submit=True):
     cat_base = st.selectbox("类别", cat_opts)
     cat_custom = st.text_input("如选“其他”，自定义名称")
     item = st.text_input("项目/备注")
-    amt = st.text_input("金额（可直接输入）", value="", placeholder="0")
+    amt = st.text_input("金额（直接输入）", value="", placeholder="0")
     ok = st.form_submit_button("保存")
 
     if ok:
         try:
-            amount = parse_amount_any(amt)
+            amount = abs(parse_amount_any(amt))
             final_cat = cat_custom.strip() if (cat_base == "其他" and cat_custom.strip()) else cat_base
-            if amount < 0:
-                amount = abs(amount)
             insert_record(USERNAME, d, book, final_cat, item, amount, rtype)
             st.sidebar.success("✅ 已保存")
             st.rerun()
-        except Exception:
+        except:
             st.sidebar.error("金额输入有误")
 
-# =========================================================
-# Load data
-# =========================================================
+
+# ---------------- Main data ----------------
 df = load_records(USERNAME)
 
-# =========================================================
-# Dashboard
-# =========================================================
 inc = df[df["rtype"] == "收入"]["amount"].sum() if not df.empty else 0.0
 exp = df[df["rtype"] == "支出"]["amount"].sum() if not df.empty else 0.0
 bal = inc - exp
@@ -385,19 +373,17 @@ c1.metric("累计总收入", f"¥ {inc:,.2f}")
 c2.metric("累计总支出", f"¥ {exp:,.2f}")
 c3.metric("净额（收入-支出）", f"¥ {bal:,.2f}")
 
-tab1, tab2, tab3 = st.tabs(["📋 明细（直接改/删）", "📊 统计", "👤 个人设置"])
+tab1, tab2, tab3 = st.tabs(["📋 明细（直接改/删）", "📊 统计/导入", "👤 个人设置"])
 
-# =========================================================
-# Tab1: Inline edit + delete
-# =========================================================
+
+# ---------------- Tab1: inline edit/delete ----------------
 with tab1:
-    st.subheader("📋 历史明细（行内修改/勾选删除）")
+    st.subheader("📋 历史明细（行内修改 / 勾选删除）")
 
     if df.empty:
         st.info("暂无记录。")
     else:
-        view = df.copy()
-        view = view.rename(columns={
+        view = df.copy().rename(columns={
             "id": "ID",
             "record_date": "日期",
             "book": "账本",
@@ -407,9 +393,7 @@ with tab1:
             "rtype": "类型",
         })
         view["日期"] = pd.to_datetime(view["日期"]).dt.date
-
-        if "🗑 删除" not in view.columns:
-            view.insert(0, "🗑 删除", False)
+        view.insert(0, "🗑 删除", False)
 
         f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 2.0])
         with f1:
@@ -435,77 +419,60 @@ with tab1:
             vv = vv[mask]
 
         st.caption(f"当前显示：{len(vv)} 条")
-        if vv.empty:
-            st.info("筛选后无记录。")
-        else:
-            edited = st.data_editor(
-                vv,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                column_config={
-                    "🗑 删除": st.column_config.CheckboxColumn("🗑 删除"),
-                    "ID": st.column_config.NumberColumn("ID", disabled=True),
-                    "日期": st.column_config.DateColumn("日期"),
-                    "金额": st.column_config.NumberColumn("金额", format="%.2f"),
-                    "类型": st.column_config.SelectboxColumn("类型", options=["收入", "支出"]),
-                    "账本": st.column_config.SelectboxColumn("账本", options=BOOK_OPTIONS),
-                },
-                key="editor_records_db"
-            )
 
-            colA, colB, colC = st.columns([1.3, 1.3, 2.4])
+        edited = st.data_editor(
+            vv,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "🗑 删除": st.column_config.CheckboxColumn("🗑 删除"),
+                "ID": st.column_config.NumberColumn("ID", disabled=True),
+                "日期": st.column_config.DateColumn("日期"),
+                "金额": st.column_config.NumberColumn("金额", format="%.2f"),
+                "类型": st.column_config.SelectboxColumn("类型", options=["收入", "支出"]),
+                "账本": st.column_config.SelectboxColumn("账本", options=BOOK_OPTIONS),
+            },
+            key="editor_records_db"
+        )
 
-            with colA:
-                if st.button("💾 保存修改", type="primary"):
-                    # take edited rows and update in DB
-                    upd = edited.drop(columns=["🗑 删除"], errors="ignore").copy()
-                    upd = upd.rename(columns={
-                        "ID": "id",
-                        "日期": "record_date",
-                        "账本": "book",
-                        "类别": "category",
-                        "项目": "item",
-                        "金额": "amount",
-                        "类型": "rtype",
-                    })
-                    upd["amount"] = pd.to_numeric(upd["amount"], errors="coerce").fillna(0.0)
-                    update_records_bulk(USERNAME, upd[["id","record_date","book","category","item","amount","rtype"]])
-                    st.success("✅ 已保存")
-                    st.rerun()
+        colA, colB = st.columns([1.2, 1.2])
 
-            with colB:
-                if st.button("🗑 执行删除（删勾选行）"):
-                    del_ids = edited.loc[edited["🗑 删除"] == True, "ID"].tolist()
-                    del_ids = [int(x) for x in del_ids]
-                    if not del_ids:
-                        st.info("未勾选任何记录。")
-                    else:
-                        delete_records(USERNAME, del_ids)
-                        st.success(f"✅ 已删除 {len(del_ids)} 条")
-                        st.rerun()
+        with colA:
+            if st.button("💾 保存修改", type="primary"):
+                upd = edited.drop(columns=["🗑 删除"]).copy().rename(columns={
+                    "ID": "id",
+                    "日期": "record_date",
+                    "账本": "book",
+                    "类别": "category",
+                    "项目": "item",
+                    "金额": "amount",
+                    "类型": "rtype",
+                })
+                upd["amount"] = pd.to_numeric(upd["amount"], errors="coerce").fillna(0.0)
+                update_records_bulk(USERNAME, upd[["id","record_date","book","category","item","amount","rtype"]])
+                st.success("✅ 已保存")
+                st.rerun()
 
-            with colC:
-                export_df = view.drop(columns=["🗑 删除"], errors="ignore").copy()
-                st.download_button(
-                    "⬇️ 下载备份 CSV",
-                    data=export_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"{USERNAME}_records_backup.csv",
-                    mime="text/csv"
-                )
+        with colB:
+            if st.button("🗑 执行删除（删勾选行）"):
+                del_ids = edited.loc[edited["🗑 删除"] == True, "ID"].tolist()
+                del_ids = [int(x) for x in del_ids]
+                delete_records(USERNAME, del_ids)
+                st.success(f"✅ 已删除 {len(del_ids)} 条")
+                st.rerun()
 
-# =========================================================
-# Tab2: Stats + import
-# =========================================================
+
+# ---------------- Tab2: stats + import ----------------
 with tab2:
     st.subheader("📊 统计中心（年 / 月 / 区间）")
+
     if df.empty:
         st.info("暂无数据可统计。")
     else:
         tdf = df.copy()
         tdf["日期"] = pd.to_datetime(tdf["record_date"])
         tdf["年份"] = tdf["日期"].dt.year
-        tdf["月份"] = tdf["日期"].dt.month
         tdf["年月"] = tdf["日期"].dt.to_period("M").astype(str)
 
         colA, colB, colC = st.columns([1.2, 1.2, 2.0])
@@ -535,32 +502,26 @@ with tab2:
         fdf = fdf[fdf["rtype"].isin(typ)]
         income_sum = fdf[fdf["rtype"] == "收入"]["amount"].sum()
         expense_sum = fdf[fdf["rtype"] == "支出"]["amount"].sum()
-        net_sum = income_sum - expense_sum
 
         s1, s2, s3 = st.columns(3)
         s1.metric("收入合计", f"¥ {income_sum:,.2f}")
         s2.metric("支出合计", f"¥ {expense_sum:,.2f}")
-        s3.metric("净额", f"¥ {net_sum:,.2f}")
+        s3.metric("净额", f"¥ {(income_sum-expense_sum):,.2f}")
 
-        st.write("### 📈 趋势（按月汇总）")
         mdf = fdf.groupby(["年月", "rtype"], as_index=False)["amount"].sum().sort_values("年月")
         wide = mdf.pivot_table(index="年月", columns="rtype", values="amount", aggfunc="sum", fill_value=0)
         st.line_chart(wide)
 
     st.divider()
     st.subheader("📥 导入 CSV（导入到当前用户）")
-    up = st.file_uploader("CSV列名建议：日期/账本/类别/项目/金额/类型", type=["csv"], key="uploader_db")
+
+    up = st.file_uploader("CSV列：日期/账本/类别/项目/金额/类型", type=["csv"])
     if up is not None:
         try:
             df_in = pd.read_csv(up)
             st.dataframe(df_in.head(20), use_container_width=True)
 
             if st.button("✅ 执行导入"):
-                # tolerant mapping
-                col_map = {c: c.strip() for c in df_in.columns}
-                df_in.rename(columns=col_map, inplace=True)
-
-                # required: 日期/金额/类型
                 dates = pd.to_datetime(df_in.get("日期", None), errors="coerce")
                 tmp = pd.DataFrame()
                 tmp["record_date"] = dates.dt.date
@@ -576,28 +537,29 @@ with tab2:
                 tcol = tcol.where(tcol.isin(["收入","支出"]), "支出")
                 tmp["rtype"] = tcol
 
-                # bulk insert
-                with get_conn().cursor() as cur:
+                conn = get_conn()
+                with conn.cursor() as cur:
                     for _, r in tmp.iterrows():
                         cur.execute(
                             """insert into records(username, record_date, book, category, item, amount, rtype)
                                values(%s,%s,%s,%s,%s,%s,%s)""",
                             [USERNAME, r["record_date"], r["book"], r["category"], r["item"], float(r["amount"]), r["rtype"]]
                         )
-                get_conn().commit()
+                conn.commit()
+
                 st.success(f"✅ 已导入 {len(tmp)} 条")
                 st.rerun()
 
         except Exception as e:
             st.error(f"导入失败：{e}")
 
-# =========================================================
-# Tab3: Profile
-# =========================================================
+
+# ---------------- Tab3: profile ----------------
 with tab3:
     st.subheader("👤 个人设置（头像 / 昵称）")
-    new_avatar = st.text_input("头像（建议一个 emoji）", value=profile["avatar"])
+    new_avatar = st.text_input("头像（emoji）", value=profile["avatar"])
     new_nick = st.text_input("昵称（右上角显示）", value=profile["nickname"])
+
     if st.button("💾 保存个人设置", type="primary"):
         a = new_avatar.strip() if new_avatar.strip() else "🙂"
         n = new_nick.strip() if new_nick.strip() else USERNAME
@@ -606,9 +568,8 @@ with tab3:
         st.rerun()
 
     st.divider()
-    st.subheader("🔒 登录持久化管理")
-    st.caption("如果你在公共电脑上登录过，可以在这里清除“保持登录”。")
-    if st.button("🧹 清除保持登录（本机）"):
+    st.subheader("🔒 清除保持登录（本机）")
+    if st.button("🧹 清除保持登录"):
         db_execute("update users set session_token_hash=%s where username=%s", ["", USERNAME])
         cookie_delete(COOKIE_NAME)
         st.success("✅ 已清除，下次需要重新登录")
