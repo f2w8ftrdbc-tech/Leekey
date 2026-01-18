@@ -8,7 +8,9 @@ import streamlit.components.v1 as components
 
 st.set_page_config(page_title="私人理财中心（公网多用户）", layout="wide")
 
-APP_SECRET = st.secrets["APP_SECRET"]
+APP_SECRET = "换成你自己的随机长字符串（>=32位，越长越好）"
+DATABASE_URL = "你的 Supabase/Neon Postgres 连接串（Neon 通常要带 ?sslmode=require ）"
+COOKIE_DAYS = 30
 DATABASE_URL = st.secrets["DATABASE_URL"]
 COOKIE_DAYS = int(st.secrets.get("COOKIE_DAYS", 30))
 COOKIE_NAME = "pf_auth"
