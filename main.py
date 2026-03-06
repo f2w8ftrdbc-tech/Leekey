@@ -10,7 +10,11 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="私人理财中心（多用户优化版）", layout="wide")
 
 # --- 从 Secrets 读取配置 ---
+# 提醒：请确保在 Streamlit Cloud 的 Secrets 中配置了 DATABASE_URL
 APP_SECRET = st.secrets.get("APP_SECRET", "default_secret_key_please_change_it")
+if "DATABASE_URL" not in st.secrets:
+    st.error("❌ 未找到 DATABASE_URL，请在 Streamlit Secrets 中配置。")
+    st.stop()
 DATABASE_URL = st.secrets["DATABASE_URL"]
 COOKIE_DAYS = int(st.secrets.get("COOKIE_DAYS", 30))
 COOKIE_NAME = "pf_auth"
@@ -32,11 +36,15 @@ def db_fetchall(sql, params=None):
 
 def db_execute(sql, params=None):
     conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute(sql, params or [])
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or [])
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
 
-# ---------------- Security & Cookies (保持原样) ----------------
+# ---------------- Security & Cookies ----------------
 def normalize_username(u: str) -> str:
     u = (u or "").strip()
     u = re.sub(r"[^A-Za-z0-9_]", "", u)
@@ -58,7 +66,7 @@ def hmac_sign(s: str) -> str:
 def sha256_token(raw: str) -> str:
     return hashlib.sha256((raw + APP_SECRET).encode("utf-8")).hexdigest()
 
-def cookie_get(name: str) -> str:
+def cookie_get(name: str):
     html = f"""<script>
     function getCookie(name) {{
       const value = `; ${{document.cookie}}`;
@@ -66,7 +74,7 @@ def cookie_get(name: str) -> str:
       if (parts.length === 2) return parts.pop().split(';').shift();
       return "";
     }}
-    Streamlit.setComponentValue(getCookie("{name}") || "");
+    window.parent.postMessage({{type: 'streamlit:setComponentValue', value: getCookie("{name}") || ""}}, '*');
     </script>"""
     return components.html(html, height=0, width=0)
 
@@ -93,7 +101,7 @@ def parse_cookie_value(v: str):
         return u, t
     except: return None, None
 
-# ---------------- Profile & Auth (保持原样) ----------------
+# ---------------- Profile & Auth ----------------
 def get_user_profile(username: str):
     rows = db_fetchall("select username, nickname, avatar from users where username=%s", [username])
     if not rows: return {"username": username, "nickname": username, "avatar": "🙂"}
@@ -102,9 +110,6 @@ def get_user_profile(username: str):
 
 def set_user_profile(username: str, nickname: str, avatar: str):
     db_execute("update users set nickname=%s, avatar=%s where username=%s", [nickname, avatar, username])
-
-def login_as(username: str):
-    st.session_state.authed_user = username
 
 def logout():
     cookie_delete(COOKIE_NAME)
@@ -123,21 +128,14 @@ def verify_session_token(username: str, raw_token: str) -> bool:
     stored = rows[0].get("session_token_hash") or ""
     return hmac.compare_digest(stored, sha256_token(raw_token))
 
-def try_auto_login_once():
-    if st.session_state.get("_cookie_checked"): return
-    st.session_state["_cookie_checked"] = True
-    if st.session_state.get("authed_user"): return
-    v = cookie_get(COOKIE_NAME)
-    if not v: return
-    u, tok = parse_cookie_value(v)
-    if u and verify_session_token(normalize_username(u), tok):
-        login_as(normalize_username(u))
-
 # ---------------- Records 核心逻辑 ----------------
 def parse_amount_any(x) -> float:
     if x is None: return 0.0
     s = str(x).strip()
-    try: return float(eval(s)) if s else 0.0
+    if not s: return 0.0
+    # 安全地过滤掉非数学字符
+    s = re.sub(r"[^0-9\+\-\*\/\.\(\)]", "", s)
+    try: return float(eval(s))
     except: return 0.0
 
 def load_records(username: str) -> pd.DataFrame:
@@ -160,10 +158,10 @@ def update_records_bulk(username: str, df: pd.DataFrame):
                         [pd.to_datetime(r["record_date"]).date(), str(r["book"]), str(r["category"]), str(r.get("item","") or ""), float(r["amount"]), str(r["rtype"]), int(r["id"]), username])
     conn.commit()
 
-def delete_records(username: str, ids: list[int]):
+def delete_records(username: str, ids: list):
     if ids: db_execute("delete from records where username=%s and id = any(%s)", [username, ids])
 
-# ---------------- UI ----------------
+# ---------------- UI 组件 ----------------
 def top_bar():
     l, r = st.columns([6, 2])
     with l: st.markdown("## 💰 私人理财中心")
@@ -175,137 +173,172 @@ def top_bar():
         else:
             if st.button("登录 / 注册", key="login_top"): st.session_state.show_login = True
 
-def login_panel():
-    if st.session_state.get("authed_user") or not st.session_state.get("show_login"): return
-    with st.expander("🔐 用户登录 / 注册", expanded=True):
-        t1, t2 = st.tabs(["登录", "注册"])
-        with t1:
-            u = st.text_input("用户名", key="login_user")
-            p = st.text_input("密码", type="password", key="login_pass")
-            if st.button("登录", key="do_login"):
-                uu = normalize_username(u)
-                rows = db_fetchall("select pass_salt, pass_hash from users where username=%s", [uu])
-                if rows and verify_password(p, rows[0]["pass_salt"], rows[0]["pass_hash"]):
-                    login_as(uu)
-                    raw = rotate_session_token(uu)
-                    cookie_set(COOKIE_NAME, make_cookie_value(uu, raw), days=COOKIE_DAYS)
-                    st.session_state.show_login = False
-                    st.rerun()
-                else: st.error("登录失败")
-        with t2:
-            u = st.text_input("新用户名", key="reg_user")
-            p1 = st.text_input("新密码", type="password", key="reg_pass1")
-            if st.button("注册", key="do_register"):
-                uu = normalize_username(u)
-                hp = pbkdf2_hash_password(p1)
-                try:
-                    db_execute("insert into users(username, pass_salt, pass_hash, nickname, avatar) values(%s,%s,%s,%s,%s)", [uu, hp["salt"], hp["hash"], uu, "🙂"])
-                    st.success("注册成功，请登录")
-                except: st.error("用户名已存在")
-
-# ---------------- 启动 ----------------
+# ---------------- 身份检查逻辑 ----------------
 if "authed_user" not in st.session_state: st.session_state.authed_user = None
 if "show_login" not in st.session_state: st.session_state.show_login = False
 
 top_bar()
 st.divider()
-try_auto_login_once()
-login_panel()
 
-if not st.session_state.get("authed_user"):
-    st.info("请先登录使用。")
+# Cookie 自动登录处理
+if not st.session_state.authed_user:
+    cookie_val = cookie_get(COOKIE_NAME)
+    # 此处利用 Streamlit 组件异步特性，如果是空可能还没加载完
+    if cookie_val:
+        u, tok = parse_cookie_value(cookie_val)
+        if u and verify_session_token(normalize_username(u), tok):
+            st.session_state.authed_user = normalize_username(u)
+            st.rerun()
+
+# 登录面板
+if not st.session_state.authed_user and st.session_state.show_login:
+    with st.expander("🔐 用户登录 / 注册", expanded=True):
+        t1, t2 = st.tabs(["登录", "注册"])
+        with t1:
+            u_in = st.text_input("用户名", key="login_user")
+            p_in = st.text_input("密码", type="password", key="login_pass")
+            if st.button("立即进入", key="do_login"):
+                uu = normalize_username(u_in)
+                rows = db_fetchall("select pass_salt, pass_hash from users where username=%s", [uu])
+                if rows and verify_password(p_in, rows[0]["pass_salt"], rows[0]["pass_hash"]):
+                    st.session_state.authed_user = uu
+                    raw = rotate_session_token(uu)
+                    cookie_set(COOKIE_NAME, make_cookie_value(uu, raw), days=COOKIE_DAYS)
+                    st.session_state.show_login = False
+                    st.rerun()
+                else: st.error("用户名或密码错误")
+        with t2:
+            ru = st.text_input("新用户名", key="reg_user")
+            rp1 = st.text_input("新密码", type="password", key="reg_pass1")
+            if st.button("注册账号", key="do_register"):
+                uu = normalize_username(ru)
+                if len(rp1) < 6: st.error("密码至少6位")
+                else:
+                    hp = pbkdf2_hash_password(rp1)
+                    try:
+                        db_execute("insert into users(username, pass_salt, pass_hash, nickname, avatar) values(%s,%s,%s,%s,%s)", [uu, hp["salt"], hp["hash"], uu, "🙂"])
+                        st.success("注册成功！请切换到登录标签页。")
+                    except: st.error("该用户名已被占用")
+
+if not st.session_state.authed_user:
+    st.info("👋 欢迎！请登录以开始管理您的私人账本。")
     st.stop()
 
+# ---------------- 主程序运行区 ----------------
 USERNAME = st.session_state.authed_user
 profile = get_user_profile(USERNAME)
 
-# --- Sidebar: 记账录入 (核心修改区) ---
+# --- Sidebar: 记账录入 ---
 st.sidebar.header("📝 记账录入")
 
-# 修改1: 类别选择移到 Form 外，实现实时联动
-rtype = st.sidebar.selectbox("1. 收支类型", ["支出", "收入"], key="sidebar_rtype")
+# 联动优化：收支类型放在 Form 外，保证实时刷新类别下拉框
+rtype = st.sidebar.selectbox("收支类型", ["支出", "收入"], key="main_rtype")
 cat_opts = EXP_CATS if rtype == "支出" else INC_CATS
 
-with st.sidebar.form("record_form", clear_on_submit=True):
-    d = st.date_input("2. 日期", value=date.today())
-    book = st.selectbox("3. 账本", BOOK_OPTIONS)
-    cat_base = st.selectbox("4. 类别", cat_opts)
-    cat_custom = st.text_input("如选“其他”，自定义名称")
-    item = st.text_input("5. 项目/备注")
-    # 修改2: 清空金额框，使用 placeholder
-    amt = st.text_input("6. 金额", value="", placeholder="直接输入数字或计算式")
+with st.sidebar.form("add_record_form", clear_on_submit=True):
+    d = st.date_input("日期", value=date.today())
+    book = st.selectbox("账本", BOOK_OPTIONS)
+    cat_base = st.selectbox("类别", cat_opts)
+    cat_custom = st.text_input("自定义类别 (选“其他”时填)")
+    item = st.text_input("备注/具体项目")
+    # 金额优化：空值+placeholder
+    amt_str = st.text_input("金额", placeholder="支持计算式如 50+10")
     
-    if st.form_submit_button("保存"):
-        try:
-            amount = abs(parse_amount_any(amt))
+    if st.form_submit_button("确认存入", use_container_width=True):
+        if not amt_str:
+            st.sidebar.warning("请输入金额")
+        else:
+            amount = abs(parse_amount_any(amt_str))
             final_cat = cat_custom.strip() if (cat_base == "其他" and cat_custom.strip()) else cat_base
             insert_record(USERNAME, d, book, final_cat, item, amount, rtype)
-            st.sidebar.success("✅ 已保存")
             st.rerun()
-        except: st.sidebar.error("金额错误")
 
-# ---------------- 数据展现 ----------------
+# --- 主界面：资产看板 ---
 df = load_records(USERNAME)
-inc = df[df["rtype"] == "收入"]["amount"].sum() if not df.empty else 0.0
-exp = df[df["rtype"] == "支出"]["amount"].sum() if not df.empty else 0.0
+inc_total = df[df["rtype"] == "收入"]["amount"].sum() if not df.empty else 0.0
+exp_total = df[df["rtype"] == "支出"]["amount"].sum() if not df.empty else 0.0
 
-c1, c2, c3 = st.columns(3)
-c1.metric("累计收入", f"¥ {inc:,.2f}")
-c2.metric("累计支出", f"¥ {exp:,.2f}")
-c3.metric("净结余", f"¥ {(inc-exp):,.2f}")
+m1, m2, m3 = st.columns(3)
+m1.metric("累计收入", f"¥ {inc_total:,.2f}")
+m2.metric("累计支出", f"¥ {exp_total:,.2f}")
+m3.metric("结余", f"¥ {(inc_total - exp_total):,.2f}")
 
-tab1, tab2, tab3 = st.tabs(["📋 明细管理", "📊 统计导入", "👤 个人设置"])
+tab1, tab2, tab3 = st.tabs(["📋 明细管理", "📊 统计中心", "👤 个人设置"])
 
 with tab1:
-    st.subheader("📋 明细记录")
+    st.subheader("历史账单明细")
     if df.empty:
-        st.info("暂无记录")
+        st.info("目前还没有记录，在左侧录入第一笔吧！")
     else:
-        view = df.copy()
-        view.insert(0, "🗑 删除", False)
-        # 筛选器保持
-        f1, f2 = st.columns(2)
-        with f1: tfilter = st.multiselect("收支类型", ["收入", "支出"], default=["收入", "支出"])
-        with f2: bfilter = st.multiselect("账本筛选", sorted(view["book"].unique().tolist()))
+        # 交互式编辑与删除区
+        view_df = df.copy()
+        view_df.insert(0, "选择", False)
         
-        vv = view[view["rtype"].isin(tfilter)].copy()
-        if bfilter: vv = vv[vv["book"].isin(bfilter)]
+        # 列表筛选
+        c_f1, c_f2 = st.columns(2)
+        with c_f1: 
+            f_type = st.multiselect("类型", ["支出", "收入"], default=["支出", "收入"])
+        with f_f2:
+            f_book = st.multiselect("账本", BOOK_OPTIONS)
         
-        # 修改3: 这里是你的删除和编辑区
-        edited = st.data_editor(
-            vv, use_container_width=True, hide_index=True,
+        filtered = view_df[view_df["rtype"].isin(f_type)]
+        if f_book: filtered = filtered[filtered["book"].isin(f_book)]
+        
+        edited_df = st.data_editor(
+            filtered,
+            use_container_width=True,
+            hide_index=True,
             column_config={
-                "🗑 删除": st.column_config.CheckboxColumn("🗑 删除"),
+                "选择": st.column_config.CheckboxColumn("🗑", help="勾选后点击下方删除"),
                 "id": st.column_config.NumberColumn("ID", disabled=True),
                 "record_date": st.column_config.DateColumn("日期"),
-                "amount": st.column_config.NumberColumn("金额", format="%.2f"),
+                "amount": st.column_config.NumberColumn("金额", format="%.2f")
             }
         )
         
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("💾 保存修改", type="primary"):
-                upd = edited.drop(columns=["🗑 删除"])
-                update_records_bulk(USERNAME, upd)
-                st.success("已更新")
-                st.rerun()
-        with colB:
-            if st.button("🗑 删除勾选行"):
-                del_ids = edited.loc[edited["🗑 删除"] == True, "id"].tolist()
-                delete_records(USERNAME, [int(x) for x in del_ids])
-                st.success(f"已删除 {len(del_ids)} 条")
+        btn_l, btn_r = st.columns([1, 4])
+        if btn_l.button("💾 保存所有修改", type="primary"):
+            update_records_bulk(USERNAME, edited_df.drop(columns=["选择"]))
+            st.success("修改已同步至数据库")
+            st.rerun()
+            
+        if btn_l.button("🗑 删除选中行"):
+            ids_to_del = edited_df.loc[edited_df["选择"] == True, "id"].tolist()
+            if ids_to_del:
+                delete_records(USERNAME, [int(i) for i in ids_to_del])
+                st.success(f"已成功删除 {len(ids_to_del)} 条记录")
                 st.rerun()
 
-# --- Tab2 & Tab3 保持你原来的逻辑 (导入、个人设置等) ---
 with tab2:
-    # ... (保持原有的统计和 CSV 导入代码)
-    st.write("统计与导入功能已保留。")
-    # (此处建议直接粘贴你原本 Tab2 里的代码块)
+    st.subheader("数据分析与导出")
+    if not df.empty:
+        # 简单的收支趋势
+        df_trend = df.copy()
+        df_trend['month'] = df_trend['record_date'].dt.to_period('M').astype(str)
+        trend_chart = df_trend.groupby(['month', 'rtype'])['amount'].sum().unstack(fill_value=0)
+        st.line_chart(trend_chart)
+        
+        st.divider()
+        # CSV 导出功能
+        csv = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 导出全量数据为 CSV", data=csv, file_name=f"records_{USERNAME}.csv", mime="text/csv")
+    else:
+        st.write("暂无统计数据。")
 
 with tab3:
-    # ... (保持原有的个人设置代码)
-    st.write("设置功能已保留。")
-    if st.button("🧹 清除保持登录"):
-        db_execute("update users set session_token_hash=%s where username=%s", ["", USERNAME])
+    st.subheader("个人资料与偏好")
+    p = get_user_profile(USERNAME)
+    new_nick = st.text_input("昵称", value=p["nickname"])
+    new_avatar = st.text_input("头像 (Emoji)", value=p["avatar"])
+    
+    if st.button("更新个人资料"):
+        set_user_profile(USERNAME, new_nick, new_avatar)
+        st.success("更新成功！")
+        st.rerun()
+    
+    st.divider()
+    if st.button("🧹 清除所有登录凭证 (下次需重新登录)"):
+        db_execute("update users set session_token_hash=NULL where username=%s", [USERNAME])
         cookie_delete(COOKIE_NAME)
-        st.success("✅ 已清除，下次需要重新登录")
+        st.success("已清除。")
+        st.rerun()
