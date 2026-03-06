@@ -1,72 +1,148 @@
-import streamlit as st
-import pandas as pd
-from datetime import date, datetime, timedelta
-from typing import Optional, List
-from contextlib import contextmanager
+import os
 import re
+import ast
+import hmac
+import math
+import sqlite3
 import secrets
 import hashlib
-import hmac
-import ast
 import operator as op
-import math
+import tempfile
+from datetime import date, datetime, timedelta
+from typing import Optional, List
 
-import psycopg2
-import psycopg2.extras
-from psycopg2.pool import SimpleConnectionPool
+import pandas as pd
+import streamlit as st
 import streamlit.components.v1 as components
 
+# ---------------- 可选依赖：Postgres ----------------
+HAS_PSYCOPG2 = True
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    HAS_PSYCOPG2 = False
+
 # ---------------- 页面配置 ----------------
-st.set_page_config(page_title="私人理财中心（多用户优化版）", layout="wide")
+st.set_page_config(page_title="私人理财中心（稳定版）", layout="wide")
 
 # ---------------- Secrets 读取 ----------------
-APP_SECRET = st.secrets.get("APP_SECRET", "default_secret_key_please_change_it")
-DATABASE_URL = st.secrets["DATABASE_URL"]
-COOKIE_DAYS = int(st.secrets.get("COOKIE_DAYS", 30))
+def secret_get(key, default=None):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+APP_SECRET = str(secret_get("APP_SECRET", "please_change_me"))
+RAW_DATABASE_URL = str(secret_get("DATABASE_URL", "") or "").strip().strip('"').strip("'")
+COOKIE_DAYS = int(secret_get("COOKIE_DAYS", 30))
+
 COOKIE_NAME = "pf_auth"
+LOCAL_SQLITE_PATH = os.path.join(tempfile.gettempdir(), "private_finance_center.db")
 
 BOOK_OPTIONS = ["生活主账", "车子专项", "学费/购汇", "理财账本"]
 EXP_CATS = ["Eat outside", "Shopping", "Bill", "Petrol", "Insurance", "Rent", "其他"]
 INC_CATS = ["工资", "业余项目", "亲情赠与", "理财收益", "其他"]
 
-# ---------------- DB ----------------
-@st.cache_resource
-def get_pool():
-    return SimpleConnectionPool(
-        minconn=1,
-        maxconn=10,
-        dsn=DATABASE_URL,
-    )
+# ---------------- DB Backend ----------------
+def clean_database_url(url: str) -> str:
+    url = (url or "").strip().strip('"').strip("'")
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
 
-@contextmanager
-def get_conn():
-    pool = get_pool()
-    conn = pool.getconn()
-    try:
-        yield conn
-    finally:
-        pool.putconn(conn)
+@st.cache_resource
+def get_db_config():
+    url = clean_database_url(RAW_DATABASE_URL)
+
+    if url and HAS_PSYCOPG2:
+        try:
+            conn = psycopg2.connect(url)
+            conn.close()
+            return {
+                "backend": "postgres",
+                "url": url,
+                "message": "当前使用 PostgreSQL",
+            }
+        except Exception as e:
+            return {
+                "backend": "sqlite",
+                "path": LOCAL_SQLITE_PATH,
+                "message": f"PostgreSQL 连接失败，已自动切换到 SQLite：{e}",
+            }
+
+    return {
+        "backend": "sqlite",
+        "path": LOCAL_SQLITE_PATH,
+        "message": "未检测到可用 PostgreSQL，当前使用 SQLite",
+    }
+
+def is_postgres() -> bool:
+    return get_db_config()["backend"] == "postgres"
+
+def sqlite_sql(sql: str) -> str:
+    return sql.replace("%s", "?")
 
 def db_fetchall(sql, params=None):
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params or [])
-            return cur.fetchall()
+    params = params or []
+    cfg = get_db_config()
 
-def db_execute(sql, params=None):
-    with get_conn() as conn:
+    if cfg["backend"] == "postgres":
+        conn = psycopg2.connect(cfg["url"], cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, params or [])
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    conn = sqlite3.connect(cfg["path"])
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(sqlite_sql(sql), params)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def db_execute(sql, params=None):
+    params = params or []
+    cfg = get_db_config()
+
+    if cfg["backend"] == "postgres":
+        conn = psycopg2.connect(cfg["url"])
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+        return
+
+    conn = sqlite3.connect(cfg["path"])
+    try:
+        cur = conn.cursor()
+        cur.execute(sqlite_sql(sql), params)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def db_executemany(sql, rows):
     if not rows:
         return
-    with get_conn() as conn:
+
+    cfg = get_db_config()
+
+    if cfg["backend"] == "postgres":
+        conn = psycopg2.connect(cfg["url"])
         try:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
@@ -74,31 +150,71 @@ def db_executemany(sql, rows):
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+        return
+
+    conn = sqlite3.connect(cfg["path"])
+    try:
+        cur = conn.cursor()
+        cur.executemany(sqlite_sql(sql), rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def ensure_tables():
-    db_execute("""
-    create table if not exists users (
-        username text primary key,
-        pass_salt text not null,
-        pass_hash text not null,
-        nickname text,
-        avatar text,
-        session_token_hash text
-    );
-    """)
-    db_execute("""
-    create table if not exists records (
-        id bigserial primary key,
-        username text not null references users(username) on delete cascade,
-        record_date date not null,
-        book text not null,
-        category text not null,
-        item text not null default '',
-        amount numeric not null default 0,
-        rtype text not null check (rtype in ('收入','支出'))
-    );
-    """)
-    db_execute("create index if not exists idx_records_user_date on records(username, record_date desc, id desc);")
+    if is_postgres():
+        db_execute("""
+        create table if not exists users (
+            username text primary key,
+            pass_salt text not null,
+            pass_hash text not null,
+            nickname text,
+            avatar text,
+            session_token_hash text
+        );
+        """)
+        db_execute("""
+        create table if not exists records (
+            id bigserial primary key,
+            username text not null references users(username) on delete cascade,
+            record_date date not null,
+            book text not null,
+            category text not null,
+            item text not null default '',
+            amount numeric not null default 0,
+            rtype text not null check (rtype in ('收入','支出'))
+        );
+        """)
+        db_execute("create index if not exists idx_records_user_date on records(username, record_date desc, id desc);")
+    else:
+        db_execute("""
+        create table if not exists users (
+            username text primary key,
+            pass_salt text not null,
+            pass_hash text not null,
+            nickname text,
+            avatar text,
+            session_token_hash text
+        );
+        """)
+        db_execute("""
+        create table if not exists records (
+            id integer primary key autoincrement,
+            username text not null,
+            record_date text not null,
+            book text not null,
+            category text not null,
+            item text not null default '',
+            amount real not null default 0,
+            rtype text not null check (rtype in ('收入','支出')),
+            foreign key (username) references users(username) on delete cascade
+        );
+        """)
+        db_execute("create index if not exists idx_records_user_date on records(username, record_date desc, id desc);")
 
 # ---------------- Security & Cookies ----------------
 def normalize_username(u: str) -> str:
@@ -124,6 +240,7 @@ def sha256_token(raw: str) -> str:
 
 COOKIE_READ_AVAILABLE = False
 cookie_manager = None
+
 try:
     import extra_streamlit_components as stx
     cookie_manager = stx.CookieManager()
@@ -133,30 +250,43 @@ except Exception:
 
 def cookie_get(name: str) -> str:
     if COOKIE_READ_AVAILABLE and cookie_manager is not None:
-        return cookie_manager.get(name) or ""
+        try:
+            return cookie_manager.get(name) or ""
+        except Exception:
+            return ""
     return ""
 
 def cookie_set(name: str, value: str, days: int):
     if COOKIE_READ_AVAILABLE and cookie_manager is not None:
-        expires_at = datetime.utcnow() + timedelta(days=days)
-        cookie_manager.set(name, value, expires_at=expires_at)
-        return
+        try:
+            expires_at = datetime.utcnow() + timedelta(days=days)
+            cookie_manager.set(name, value, expires_at=expires_at)
+            return
+        except Exception:
+            pass
 
-    html = f"""<script>
+    html = f"""
+    <script>
     const d = new Date();
     d.setTime(d.getTime() + ({days} * 24 * 60 * 60 * 1000));
     document.cookie = "{name}={value};expires=" + d.toUTCString() + ";path=/;SameSite=Lax";
-    </script>"""
+    </script>
+    """
     components.html(html, height=0, width=0)
 
 def cookie_delete(name: str):
     if COOKIE_READ_AVAILABLE and cookie_manager is not None:
-        cookie_manager.delete(name)
-        return
+        try:
+            cookie_manager.delete(name)
+            return
+        except Exception:
+            pass
 
-    html = f"""<script>
+    html = f"""
+    <script>
     document.cookie = "{name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Lax";
-    </script>"""
+    </script>
+    """
     components.html(html, height=0, width=0)
 
 def make_cookie_value(username: str, raw_token: str) -> str:
@@ -186,10 +316,7 @@ def get_user_profile(username: str):
     }
 
 def set_user_profile(username: str, nickname: str, avatar: str):
-    db_execute(
-        "update users set nickname=%s, avatar=%s where username=%s",
-        [nickname, avatar, username],
-    )
+    db_execute("update users set nickname=%s, avatar=%s where username=%s", [nickname, avatar, username])
 
 def login_as(username: str):
     st.session_state.authed_user = username
@@ -202,10 +329,7 @@ def logout():
 
 def rotate_session_token(username: str) -> str:
     raw = secrets.token_urlsafe(24)
-    db_execute(
-        "update users set session_token_hash=%s where username=%s",
-        [sha256_token(raw), username],
-    )
+    db_execute("update users set session_token_hash=%s where username=%s", [sha256_token(raw), username])
     return raw
 
 def verify_session_token(username: str, raw_token: str) -> bool:
@@ -218,21 +342,20 @@ def verify_session_token(username: str, raw_token: str) -> bool:
 def try_auto_login_once():
     if st.session_state.get("_cookie_checked"):
         return
+
     if st.session_state.get("authed_user"):
         st.session_state["_cookie_checked"] = True
         return
 
     v = cookie_get(COOKIE_NAME)
-    if not v:
-        st.session_state["_cookie_checked"] = True
-        return
+    if v:
+        u, tok = parse_cookie_value(v)
+        if u and tok and verify_session_token(normalize_username(u), tok):
+            login_as(normalize_username(u))
 
-    u, tok = parse_cookie_value(v)
-    if u and tok and verify_session_token(normalize_username(u), tok):
-        login_as(normalize_username(u))
     st.session_state["_cookie_checked"] = True
 
-# ---------------- Records 核心逻辑 ----------------
+# ---------------- 金额表达式安全解析 ----------------
 _ALLOWED_OPS = {
     ast.Add: op.add,
     ast.Sub: op.sub,
@@ -250,10 +373,7 @@ def _safe_eval_expr(node):
             return node.value
         raise ValueError("只允许数字")
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_OPS:
-        return _ALLOWED_OPS[type(node.op)](
-            _safe_eval_expr(node.left),
-            _safe_eval_expr(node.right),
-        )
+        return _ALLOWED_OPS[type(node.op)](_safe_eval_expr(node.left), _safe_eval_expr(node.right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_OPS:
         return _ALLOWED_OPS[type(node.op)](_safe_eval_expr(node.operand))
     if isinstance(node, ast.Expression):
@@ -261,9 +381,6 @@ def _safe_eval_expr(node):
     raise ValueError("不支持的表达式")
 
 def parse_amount_any(x) -> float:
-    """
-    允许数字、小数、+ - * / ( )
-    """
     if x is None:
         return 0.0
     s = str(x).strip()
@@ -287,6 +404,7 @@ def parse_amount_any(x) -> float:
         raise ValueError("金额必须是有限数字")
     return val
 
+# ---------------- Records ----------------
 def load_records(username: str) -> pd.DataFrame:
     rows = db_fetchall(
         """
@@ -299,6 +417,7 @@ def load_records(username: str) -> pd.DataFrame:
     )
     if not rows:
         return pd.DataFrame(columns=["id", "record_date", "book", "category", "item", "amount", "rtype"])
+
     df = pd.DataFrame(rows)
     df["record_date"] = pd.to_datetime(df["record_date"], errors="coerce")
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
@@ -314,40 +433,24 @@ def insert_record(username: str, d: date, book: str, cat: str, item: str, amt: f
         insert into records(username, record_date, book, category, item, amount, rtype)
         values(%s,%s,%s,%s,%s,%s,%s)
         """,
-        [username, d, book, cat, item or "", float(amt), rtype],
+        [username, str(d), book, cat, item or "", float(amt), rtype],
     )
 
 def insert_records_bulk(username: str, rows: List[tuple]):
     if not rows:
         return
-    payload = [
-        (
-            username,
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            float(r[4]),
-            r[5],
-        )
-        for r in rows
-    ]
-    with get_conn() as conn:
-        try:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(
-                    cur,
-                    """
-                    insert into records(username, record_date, book, category, item, amount, rtype)
-                    values %s
-                    """,
-                    payload,
-                    page_size=500,
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+
+    payload = []
+    for r in rows:
+        payload.append((username, str(r[0]), r[1], r[2], r[3], float(r[4]), r[5]))
+
+    db_executemany(
+        """
+        insert into records(username, record_date, book, category, item, amount, rtype)
+        values(%s,%s,%s,%s,%s,%s,%s)
+        """,
+        payload,
+    )
 
 def update_records_bulk(username: str, df: pd.DataFrame):
     if df.empty:
@@ -360,15 +463,16 @@ def update_records_bulk(username: str, df: pd.DataFrame):
         record_date = pd.to_datetime(r["record_date"], errors="coerce")
         if pd.isna(record_date):
             raise ValueError("存在无效日期")
+
         book = str(r["book"]).strip()
         category = str(r["category"]).strip()
         item = str(r.get("item", "") or "").strip()
         amount = float(r["amount"])
         rtype = str(r["rtype"]).strip()
 
-        if book == "":
+        if not book:
             raise ValueError("账本不能为空")
-        if category == "":
+        if not category:
             raise ValueError("类别不能为空")
         if rtype not in valid_rtypes:
             raise ValueError("收支类型只能是“收入”或“支出”")
@@ -376,7 +480,7 @@ def update_records_bulk(username: str, df: pd.DataFrame):
             raise ValueError("金额无效")
 
         rows.append((
-            record_date.date(),
+            str(record_date.date()),
             book,
             category,
             item,
@@ -398,16 +502,47 @@ def update_records_bulk(username: str, df: pd.DataFrame):
 def delete_records(username: str, ids: List[int]):
     if not ids:
         return
-    db_execute(
-        "delete from records where username=%s and id = any(%s::bigint[])",
-        [username, ids],
-    )
+
+    cfg = get_db_config()
+
+    if cfg["backend"] == "postgres":
+        conn = psycopg2.connect(cfg["url"])
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "delete from records where username=%s and id = any(%s)",
+                    [username, ids],
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return
+
+    conn = sqlite3.connect(cfg["path"])
+    try:
+        cur = conn.cursor()
+        placeholders = ",".join(["?"] * len(ids))
+        cur.execute(
+            f"delete from records where username=? and id in ({placeholders})",
+            [username] + [int(x) for x in ids],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 # ---------------- UI ----------------
 def top_bar():
     left, right = st.columns([6, 2])
+
     with left:
         st.markdown("## 💰 私人理财中心")
+
     with right:
         if st.session_state.get("authed_user"):
             p = get_user_profile(st.session_state.authed_user)
@@ -426,18 +561,16 @@ def login_panel():
         return
 
     with st.expander("🔐 用户登录 / 注册", expanded=True):
-        tab_login, tab_register = st.tabs(["登录", "注册"])
+        t1, t2 = st.tabs(["登录", "注册"])
 
-        with tab_login:
+        with t1:
             u = st.text_input("用户名", key="login_user")
             p = st.text_input("密码", type="password", key="login_pass")
 
             if st.button("登录", key="do_login"):
                 uu = normalize_username(u)
-                rows = db_fetchall(
-                    "select pass_salt, pass_hash from users where username=%s",
-                    [uu],
-                )
+                rows = db_fetchall("select pass_salt, pass_hash from users where username=%s", [uu])
+
                 if rows and verify_password(p, rows[0]["pass_salt"], rows[0]["pass_hash"]):
                     login_as(uu)
                     raw = rotate_session_token(uu)
@@ -447,7 +580,7 @@ def login_panel():
                 else:
                     st.error("登录失败：用户名或密码错误")
 
-        with tab_register:
+        with t2:
             u = st.text_input("新用户名", key="reg_user")
             p1 = st.text_input("新密码", type="password", key="reg_pass1")
             p2 = st.text_input("确认新密码", type="password", key="reg_pass2")
@@ -477,9 +610,6 @@ def login_panel():
                 except Exception:
                     st.error("用户名已存在或数据库错误")
 
-def make_default_series(df: pd.DataFrame, value):
-    return pd.Series([value] * len(df), index=df.index)
-
 def clean_text_series(series: pd.Series, default_value: str = "") -> pd.Series:
     s = series.copy()
     s = s.where(s.notna(), default_value)
@@ -500,6 +630,11 @@ if "_cookie_checked" not in st.session_state:
 try_auto_login_once()
 top_bar()
 st.divider()
+
+cfg = get_db_config()
+if cfg["backend"] == "sqlite":
+    st.warning(cfg["message"])
+
 login_panel()
 
 if not st.session_state.get("authed_user"):
@@ -509,7 +644,6 @@ if not st.session_state.get("authed_user"):
     st.stop()
 
 USERNAME = st.session_state.authed_user
-profile = get_user_profile(USERNAME)
 
 # ---------------- Sidebar: 记账录入 ----------------
 st.sidebar.header("📝 记账录入")
@@ -541,10 +675,10 @@ df = load_records(USERNAME)
 inc = df[df["rtype"] == "收入"]["amount"].sum() if not df.empty else 0.0
 exp = df[df["rtype"] == "支出"]["amount"].sum() if not df.empty else 0.0
 
-m1, m2, m3 = st.columns(3)
-m1.metric("累计收入", f"¥ {inc:,.2f}")
-m2.metric("累计支出", f"¥ {exp:,.2f}")
-m3.metric("净结余", f"¥ {(inc - exp):,.2f}")
+c1, c2, c3 = st.columns(3)
+c1.metric("累计收入", f"¥ {inc:,.2f}")
+c2.metric("累计支出", f"¥ {exp:,.2f}")
+c3.metric("净结余", f"¥ {(inc - exp):,.2f}")
 
 tab1, tab2, tab3 = st.tabs(["📋 明细管理", "📊 统计导入", "👤 个人设置"])
 
@@ -592,14 +726,15 @@ with tab1:
                 "amount": st.column_config.NumberColumn("金额", format="%.2f"),
                 "rtype": st.column_config.SelectboxColumn("收支类型", options=["收入", "支出"]),
                 "book": st.column_config.SelectboxColumn("账本", options=BOOK_OPTIONS),
-                "item": st.column_config.TextColumn("项目/备注"),
                 "category": st.column_config.TextColumn("类别"),
+                "item": st.column_config.TextColumn("项目/备注"),
             },
+            key="records_editor",
         )
 
-        col_a, col_b, col_c = st.columns([2, 2, 3])
-        with col_a:
-            if st.button("💾 保存修改", type="primary"):
+        colA, colB, colC = st.columns([2, 2, 3])
+        with colA:
+            if st.button("💾 保存修改", type="primary", key="save_records_btn"):
                 try:
                     upd = edited.drop(columns=["🗑 删除"])
                     update_records_bulk(USERNAME, upd)
@@ -607,8 +742,9 @@ with tab1:
                     st.rerun()
                 except Exception as e:
                     st.error(f"保存失败：{e}")
-        with col_b:
-            if st.button("🗑 删除勾选行"):
+
+        with colB:
+            if st.button("🗑 删除勾选行", key="delete_records_btn"):
                 try:
                     del_ids = edited.loc[edited["🗑 删除"] == True, "id"].tolist()
                     delete_records(USERNAME, [int(x) for x in del_ids])
@@ -616,7 +752,8 @@ with tab1:
                     st.rerun()
                 except Exception as e:
                     st.error(f"删除失败：{e}")
-        with col_c:
+
+        with colC:
             st.caption("提示：直接在表格里修改日期/账本/类别/备注/金额/收支类型，然后点“保存修改”。")
 
 # ---------------- Tab2：统计 + 导入导出 ----------------
@@ -628,13 +765,13 @@ with tab2:
     else:
         s1, s2, s3, s4 = st.columns([2, 2, 2, 2])
         with s1:
-            dmin = st.date_input("起始日期", value=df["record_date"].min().date())
+            dmin = st.date_input("起始日期", value=df["record_date"].min().date(), key="stat_dmin")
         with s2:
-            dmax = st.date_input("结束日期", value=df["record_date"].max().date())
+            dmax = st.date_input("结束日期", value=df["record_date"].max().date(), key="stat_dmax")
         with s3:
-            book_sel = st.multiselect("账本", BOOK_OPTIONS, default=BOOK_OPTIONS)
+            book_sel = st.multiselect("账本", BOOK_OPTIONS, default=BOOK_OPTIONS, key="stat_book_sel")
         with s4:
-            type_sel = st.multiselect("收支类型", ["收入", "支出"], default=["收入", "支出"])
+            type_sel = st.multiselect("收支类型", ["收入", "支出"], default=["收入", "支出"], key="stat_type_sel")
 
         dff = df.copy()
         dff = dff[(dff["record_date"].dt.date >= dmin) & (dff["record_date"].dt.date <= dmax)]
@@ -643,10 +780,10 @@ with tab2:
         if type_sel:
             dff = dff[dff["rtype"].isin(type_sel)]
 
-        t1, t2, t3 = st.columns(3)
-        t1.metric("区间收入", f"¥ {dff[dff['rtype'] == '收入']['amount'].sum():,.2f}")
-        t2.metric("区间支出", f"¥ {dff[dff['rtype'] == '支出']['amount'].sum():,.2f}")
-        t3.metric(
+        a1, a2, a3 = st.columns(3)
+        a1.metric("区间收入", f"¥ {dff[dff['rtype'] == '收入']['amount'].sum():,.2f}")
+        a2.metric("区间支出", f"¥ {dff[dff['rtype'] == '支出']['amount'].sum():,.2f}")
+        a3.metric(
             "区间净结余",
             f"¥ {(dff[dff['rtype'] == '收入']['amount'].sum() - dff[dff['rtype'] == '支出']['amount'].sum()):,.2f}",
         )
@@ -656,7 +793,7 @@ with tab2:
         tmp = dff.copy()
         tmp["month"] = tmp["record_date"].dt.to_period("M").astype(str)
         monthly = (
-            tmp.groupby(["month", "rtype"], dropna=False)["amount"]
+            tmp.groupby(["month", "rtype"])["amount"]
             .sum()
             .reset_index()
             .pivot(index="month", columns="rtype", values="amount")
@@ -677,8 +814,9 @@ with tab2:
         st.divider()
 
         st.markdown("#### 🧾 按类别汇总")
-        c1, c2 = st.columns(2)
-        with c1:
+        cc1, cc2 = st.columns(2)
+
+        with cc1:
             exp_cat = tmp[tmp["rtype"] == "支出"].groupby("category")["amount"].sum().sort_values(ascending=False)
             st.write("支出类别 Top")
             st.dataframe(exp_cat.reset_index().rename(columns={"amount": "sum"}), use_container_width=True)
@@ -686,7 +824,8 @@ with tab2:
                 st.bar_chart(exp_cat, use_container_width=True)
             else:
                 st.info("暂无支出类别数据")
-        with c2:
+
+        with cc2:
             inc_cat = tmp[tmp["rtype"] == "收入"].groupby("category")["amount"].sum().sort_values(ascending=False)
             st.write("收入类别 Top")
             st.dataframe(inc_cat.reset_index().rename(columns={"amount": "sum"}), use_container_width=True)
@@ -700,6 +839,7 @@ with tab2:
         st.markdown("#### ⬇️ 导出 CSV")
         export_df = dff.copy()
         export_df["record_date"] = export_df["record_date"].dt.date.astype(str)
+
         st.download_button(
             "下载当前筛选数据（CSV）",
             data=export_df.to_csv(index=False).encode("utf-8-sig"),
@@ -710,13 +850,15 @@ with tab2:
     st.divider()
 
     st.markdown("#### ⬆️ 导入 CSV（追加到数据库）")
-    st.caption("支持列名：record_date/book/category/item/amount/rtype（大小写不敏感）；也支持你自定义映射。")
+    st.caption("支持列名：record_date / book / category / item / amount / rtype（大小写不敏感）；也支持手动映射。")
 
-    up = st.file_uploader("上传 CSV 文件", type=["csv"])
+    up = st.file_uploader("上传 CSV 文件", type=["csv"], key="csv_uploader")
+
     if up is not None:
         try:
             imp = pd.read_csv(up)
             imp.columns = [str(c).strip() for c in imp.columns]
+
             st.write("预览：")
             st.dataframe(imp.head(20), use_container_width=True)
 
@@ -724,9 +866,8 @@ with tab2:
 
             def pick(*names):
                 for n in names:
-                    key = str(n).lower()
-                    if key in cols_lower:
-                        return cols_lower[key]
+                    if str(n).lower() in cols_lower:
+                        return cols_lower[str(n).lower()]
                 return None
 
             col_date = pick("record_date", "date", "日期")
@@ -737,45 +878,56 @@ with tab2:
             col_type = pick("rtype", "type", "收支类型")
 
             st.write("字段映射（可修改）：")
-            c_map1, c_map2, c_map3 = st.columns(3)
-            with c_map1:
+            m1, m2, m3 = st.columns(3)
+
+            options = [None] + imp.columns.tolist()
+
+            with m1:
                 map_date = st.selectbox(
                     "日期列",
-                    options=[None] + imp.columns.tolist(),
+                    options=options,
                     index=(imp.columns.tolist().index(col_date) + 1 if col_date in imp.columns else 0),
+                    key="map_date",
                 )
                 map_amt = st.selectbox(
                     "金额列",
-                    options=[None] + imp.columns.tolist(),
+                    options=options,
                     index=(imp.columns.tolist().index(col_amt) + 1 if col_amt in imp.columns else 0),
+                    key="map_amt",
                 )
-            with c_map2:
+
+            with m2:
                 map_book = st.selectbox(
                     "账本列",
-                    options=[None] + imp.columns.tolist(),
+                    options=options,
                     index=(imp.columns.tolist().index(col_book) + 1 if col_book in imp.columns else 0),
+                    key="map_book",
                 )
                 map_type = st.selectbox(
                     "收支类型列",
-                    options=[None] + imp.columns.tolist(),
+                    options=options,
                     index=(imp.columns.tolist().index(col_type) + 1 if col_type in imp.columns else 0),
+                    key="map_type",
                 )
-            with c_map3:
+
+            with m3:
                 map_cat = st.selectbox(
                     "类别列",
-                    options=[None] + imp.columns.tolist(),
+                    options=options,
                     index=(imp.columns.tolist().index(col_cat) + 1 if col_cat in imp.columns else 0),
+                    key="map_cat",
                 )
                 map_item = st.selectbox(
                     "备注列",
-                    options=[None] + imp.columns.tolist(),
+                    options=options,
                     index=(imp.columns.tolist().index(col_item) + 1 if col_item in imp.columns else 0),
+                    key="map_item",
                 )
 
-            default_book = st.selectbox("若 CSV 没有账本列：默认账本", BOOK_OPTIONS, index=0)
-            default_type = st.selectbox("若 CSV 没有收支类型列：默认类型", ["支出", "收入"], index=0)
+            default_book = st.selectbox("若 CSV 没有账本列：默认账本", BOOK_OPTIONS, index=0, key="default_book")
+            default_type = st.selectbox("若 CSV 没有收支类型列：默认类型", ["支出", "收入"], index=0, key="default_type")
 
-            if st.button("开始导入（追加）", type="primary"):
+            if st.button("开始导入（追加）", type="primary", key="import_btn"):
                 if map_date is None or map_amt is None:
                     st.error("至少需要映射：日期列、金额列")
                 else:
@@ -785,31 +937,32 @@ with tab2:
                     work["_amt"] = work[map_amt].apply(lambda v: abs(parse_amount_any(v)))
 
                     if map_book is None:
-                        work["_book"] = make_default_series(work, default_book)
+                        work["_book"] = default_book
                     else:
                         work["_book"] = clean_text_series(work[map_book], default_book)
                         work.loc[work["_book"].str.strip() == "", "_book"] = default_book
 
                     if map_type is None:
-                        work["_rtype"] = make_default_series(work, default_type)
+                        work["_rtype"] = default_type
                     else:
                         t = clean_text_series(work[map_type], default_type).str.strip()
                         t_lower = t.str.lower()
-                        mapped = pd.Series(index=t.index, dtype=object)
-                        mapped[t.isin(["收入", "支出"])] = t[t.isin(["收入", "支出"])]
-                        mapped[t_lower.isin(["expense", "exp", "out", "支出", "0"])] = "支出"
-                        mapped[t_lower.isin(["income", "inc", "in", "收入", "1"])] = "收入"
-                        mapped = mapped.where(mapped.notna(), default_type)
+
+                        mapped = pd.Series([default_type] * len(t), index=t.index)
+                        mapped[t.isin(["支出", "收入"])] = t[t.isin(["支出", "收入"])]
+                        mapped[t_lower.isin(["expense", "exp", "out", "0"])] = "支出"
+                        mapped[t_lower.isin(["income", "inc", "in", "1"])] = "收入"
+
                         work["_rtype"] = mapped
 
                     if map_cat is None:
-                        work["_cat"] = make_default_series(work, "其他")
+                        work["_cat"] = "其他"
                     else:
                         work["_cat"] = clean_text_series(work[map_cat], "其他")
                         work.loc[work["_cat"].str.strip() == "", "_cat"] = "其他"
 
                     if map_item is None:
-                        work["_item"] = make_default_series(work, "")
+                        work["_item"] = ""
                     else:
                         work["_item"] = clean_text_series(work[map_item], "")
 
@@ -841,24 +994,26 @@ with tab3:
     st.subheader("👤 个人设置")
 
     p = get_user_profile(USERNAME)
-    c_left, c_right = st.columns([2, 3])
+    x1, x2 = st.columns([2, 3])
 
-    with c_left:
-        avatar = st.text_input("头像（可用 emoji）", value=p["avatar"] or "🙂")
-        nickname = st.text_input("昵称", value=p["nickname"] or USERNAME)
-        if st.button("保存资料", type="primary"):
+    with x1:
+        avatar = st.text_input("头像（可用 emoji）", value=p["avatar"] or "🙂", key="profile_avatar")
+        nickname = st.text_input("昵称", value=p["nickname"] or USERNAME, key="profile_nickname")
+
+        if st.button("保存资料", type="primary", key="save_profile_btn"):
             set_user_profile(USERNAME, nickname.strip() or USERNAME, avatar.strip() or "🙂")
             st.success("✅ 已保存")
             st.rerun()
 
-    with c_right:
+    with x2:
         st.markdown("##### 🔑 修改密码")
-        oldp = st.text_input("旧密码", type="password")
-        newp1 = st.text_input("新密码", type="password")
-        newp2 = st.text_input("确认新密码", type="password")
+        oldp = st.text_input("旧密码", type="password", key="old_password")
+        newp1 = st.text_input("新密码", type="password", key="new_password_1")
+        newp2 = st.text_input("确认新密码", type="password", key="new_password_2")
 
-        if st.button("更新密码"):
+        if st.button("更新密码", key="update_password_btn"):
             rows = db_fetchall("select pass_salt, pass_hash from users where username=%s", [USERNAME])
+
             if not rows or not verify_password(oldp, rows[0]["pass_salt"], rows[0]["pass_hash"]):
                 st.error("旧密码不正确")
             elif not newp1:
@@ -878,7 +1033,8 @@ with tab3:
                 st.rerun()
 
     st.divider()
-    if st.button("🧹 清除保持登录"):
+
+    if st.button("🧹 清除保持登录", key="clear_login_btn"):
         db_execute("update users set session_token_hash=%s where username=%s", ["", USERNAME])
         cookie_delete(COOKIE_NAME)
         st.success("✅ 已清除，下次需要重新登录")
